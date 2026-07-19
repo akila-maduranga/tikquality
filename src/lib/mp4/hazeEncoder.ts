@@ -134,9 +134,16 @@ export async function hazeEncode(
 /**
  * Header Patch mode (the real "Haze Method" / metadata exploit).
  *
- * Patches ONLY the mvhd (Movie Header) timescale to create a duration mismatch
- * between the movie container (mvhd) and the media track (mdhd). This is the
- * "lie" that tricks TikTok's ingest parser into passthrough mode.
+ * Patches the mvhd (Movie Header) timescale to a non-standard massive value.
+ * This is the "lie" that tricks TikTok's ingest parser into passthrough mode:
+ * it sees the non-standard timescale, fails to match a standard compression
+ * profile, and defaults to passthrough to avoid breaking the file.
+ *
+ * CRITICAL: We scale BOTH mvhd.timescale AND mvhd.duration by `mult`. This
+ * keeps the movie duration correct (duration/timescale is unchanged) so the
+ * video plays at full length. The "lie" is the non-standard timescale value
+ * itself, NOT a duration mismatch. (A duration mismatch would make players
+ * truncate the video — e.g., a 19s video showing as 1s.)
  *
  * Does NOT touch:
  *   - mdhd (media header) — media track stays internally consistent
@@ -147,18 +154,13 @@ export async function hazeEncode(
  * whatever. The video plays identically to the original.
  *
  * Changes:
- *   1. mvhd.timescale × mult (keep mvhd.duration) → movie duration appears
- *      mult× shorter, creating a mismatch with mdhd duration. This is the
- *      core "lie" that confuses TikTok.
+ *   1. mvhd.timescale × mult AND mvhd.duration × mult → movie duration stays
+ *      correct, but timescale is non-standard (the "lie").
  *   2. moov moved after mdat → faststart OFF.
  *   3. Encoder tag written to trak/udta/ilst.
  *   4. handler_name set in hdlr.
  *   5. tkhd width/height forced to 1080×1920 (TikTok 9:16) if enabled.
- *
- * Note: r_frame_rate and avg_frame_rate in ffprobe stay the same (they come
- * from mdhd/stts which we don't touch). The mvhd duration mismatch is what
- * tools like TikTok's ingest analyzer see — they compute "movie FPS" as
- * sample_count / mvhd_duration, which appears mult× higher.
+ *   6. stco/co64 offsets shifted to account for box reordering.
  */
 async function hazeHeaderPatch(
   data: Uint8Array,
@@ -194,21 +196,48 @@ async function hazeHeaderPatch(
   const mdia = findChild(videoTrak, "mdia");
   if (!mdia) throw new Error("mdia box not found in video track.");
 
-  // Step 3: Patch mvhd timescale — THE core of the metadata exploit.
-  // We multiply mvhd.timescale by `mult` but keep mvhd.duration the same.
-  // This makes the movie container duration appear `mult`× shorter,
-  // creating a mismatch with the media track (mdhd) duration. TikTok's
-  // ingest parser sees this non-standard timescale and may fall back to
-  // passthrough mode to avoid breaking the file.
+  // Step 3: Patch mvhd — scale BOTH timescale AND duration by `mult`.
+  // This keeps movie duration = duration/timescale unchanged (video plays
+  // full length) while making the timescale value non-standard (the "lie"
+  // that confuses TikTok's ingest parser).
   onProgress?.("Patching mvhd timescale (the lie)", 30);
   const mvhd = findChild(moov, "mvhd");
   if (mvhd) {
-    patchMvhdTimescale(mvhd, mult);
+    patchMvhd(mvhd, mult);
+  }
+
+  // Step 3.5: Patch ALL tkhd durations — tkhd.duration is in mvhd.timescale
+  // units. Since we just scaled mvhd.timescale by `mult`, we must also scale
+  // every track's tkhd.duration by `mult` to keep the real-time duration
+  // correct. Otherwise ffprobe/players compute track duration as
+  // tkhd.duration / new_mvhd.timescale = original_duration / mult, making
+  // the video appear mult× shorter (e.g., 2s video shows as 0.105s).
+  onProgress?.("Patching track durations", 40);
+  for (const trak of moov.children) {
+    if (trak.type !== "trak") continue;
+    const tkhd = findChild(trak, "tkhd");
+    if (tkhd) {
+      patchTkhdDuration(tkhd, mult);
+    }
+
+    // Also patch elst (Edit List) segment_durations — these are also in
+    // mvhd.timescale units. If we don't scale them, the edit list tells the
+    // player to only play the first original_duration / new_timescale seconds,
+    // truncating the video. This is the sneaky one — most files have an elst
+    // with a single entry matching the track duration.
+    const edts = findChild(trak, "edts");
+    if (edts) {
+      const elst = findChild(edts, "elst");
+      if (elst) {
+        patchElstDurations(elst, mult);
+      }
+    }
   }
 
   // NOTE: We deliberately do NOT touch mdhd, stts, stsz, stsc, or stss.
   // The media track stays internally consistent so the video plays correctly.
-  // Only the movie container header (mvhd) is lied about.
+  // Only the movie container header (mvhd), track headers (tkhd), and edit
+  // lists (elst) are patched — all of which use mvhd.timescale units.
 
   // Step 3.5: Shift stco/co64 chunk offsets to account for the box reordering.
   // When we move mdat to position 2 (right after ftyp), its file offset changes.
@@ -284,15 +313,17 @@ async function hazeHeaderPatch(
 // ============================================================================
 
 /**
- * Patch mvhd (Movie Header Box) timescale by multiplying it by `mult`.
- * Keeps mvhd.duration UNCHANGED — this creates the duration mismatch that is
- * the core of the haze metadata exploit.
+ * Patch mvhd (Movie Header Box) by scaling BOTH timescale AND duration by `mult`.
+ *
+ * This keeps movie duration = duration/timescale UNCHANGED (so the video plays
+ * at full length), while making the timescale value non-standard (the "lie"
+ * that confuses TikTok's ingest parser into passthrough mode).
  *
  * mvhd v0: 1 byte version, 3 bytes flags, 4 bytes creation, 4 bytes modification,
  *           4 bytes timescale, 4 bytes duration, ...
  * mvhd v1: same but creation/modification/duration are 8 bytes each.
  */
-function patchMvhdTimescale(mvhd: Box, mult: number): void {
+function patchMvhd(mvhd: Box, mult: number): void {
   const p = mvhd.payload;
   if (p.length < 4) return;
   const version = p[0];
@@ -301,21 +332,148 @@ function patchMvhdTimescale(mvhd: Box, mult: number): void {
   newPayload.set(p);
 
   if (version === 1) {
-    // timescale at offset 20 (after 4 version/flags + 8 creation + 8 modification)
-    if (p.length < 24) return;
+    // v1 layout: 4 version/flags + 8 creation + 8 modification + 4 timescale + 8 duration
+    if (p.length < 32) return;
+    // timescale at offset 20 (4 bytes)
     const oldTimescale = readU32(p, 20);
-    const newTimescale = oldTimescale * mult;
-    writeU32(newPayload, 20, newTimescale <= 0xffffffff ? newTimescale : newTimescale >>> 0);
-    // duration at offset 24 (8 bytes) — keep UNCHANGED
+    writeU32(newPayload, 20, oldTimescale * mult);
+    // duration at offset 24 (8 bytes) — scale by mult too
+    const oldDurationLo = readU32(p, 28);
+    const oldDurationHi = readU32(p, 24);
+    if (oldDurationHi === 0) {
+      const newDuration = oldDurationLo * mult;
+      if (newDuration > 0xffffffff) {
+        const big = BigInt(oldDurationLo) * BigInt(mult);
+        writeU32(newPayload, 24, Number((big >> 32n) & 0xffffffffn));
+        writeU32(newPayload, 28, Number(big & 0xffffffffn));
+      } else {
+        writeU32(newPayload, 24, 0);
+        writeU32(newPayload, 28, newDuration);
+      }
+    } else {
+      const big = (BigInt(oldDurationHi) << 32n) | BigInt(oldDurationLo);
+      const newBig = big * BigInt(mult);
+      writeU32(newPayload, 24, Number((newBig >> 32n) & 0xffffffffn));
+      writeU32(newPayload, 28, Number(newBig & 0xffffffffn));
+    }
   } else {
-    // version 0: timescale at offset 12 (after 4 version/flags + 4 creation + 4 modification)
-    if (p.length < 16) return;
+    // v0 layout: 4 version/flags + 4 creation + 4 modification + 4 timescale + 4 duration
+    if (p.length < 20) return;
+    // timescale at offset 12 (4 bytes)
     const oldTimescale = readU32(p, 12);
-    const newTimescale = oldTimescale * mult;
-    writeU32(newPayload, 12, newTimescale <= 0xffffffff ? newTimescale : newTimescale >>> 0);
-    // duration at offset 16 (4 bytes) — keep UNCHANGED
+    writeU32(newPayload, 12, oldTimescale * mult);
+    // duration at offset 16 (4 bytes) — scale by mult too
+    const oldDuration = readU32(p, 16);
+    const newDuration = oldDuration * mult;
+    writeU32(newPayload, 16, newDuration <= 0xffffffff ? newDuration : newDuration >>> 0);
   }
   mvhd.payload = newPayload;
+}
+
+/**
+ * Patch tkhd (Track Header Box) duration by scaling it by `mult`.
+ *
+ * tkhd.duration is in movie (mvhd) timescale units. When we scale mvhd.timescale
+ * by `mult`, we must also scale tkhd.duration by `mult` to keep the real-time
+ * track duration correct. Otherwise the track duration becomes
+ * original_tkhd_duration / new_mvhd_timescale = original_real_duration / mult,
+ * making the video appear mult× shorter.
+ *
+ * tkhd v0: 4 version/flags + 4 creation + 4 modification + 4 trackID + 4 reserved + 4 duration + ...
+ * tkhd v1: 4 version/flags + 8 creation + 8 modification + 4 trackID + 4 reserved + 8 duration + ...
+ */
+function patchTkhdDuration(tkhd: Box, mult: number): void {
+  const p = tkhd.payload;
+  if (p.length < 4) return;
+  const version = p[0];
+
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+
+  if (version === 1) {
+    // v1: duration at offset 28 (8 bytes), after 4 flags + 8 creation + 8 mod + 4 trackID + 4 reserved
+    if (p.length < 36) return;
+    const oldDurLo = readU32(p, 32);
+    const oldDurHi = readU32(p, 28);
+    if (oldDurHi === 0) {
+      const newDur = oldDurLo * mult;
+      if (newDur > 0xffffffff) {
+        const big = BigInt(oldDurLo) * BigInt(mult);
+        writeU32(newPayload, 28, Number((big >> 32n) & 0xffffffffn));
+        writeU32(newPayload, 32, Number(big & 0xffffffffn));
+      } else {
+        writeU32(newPayload, 28, 0);
+        writeU32(newPayload, 32, newDur);
+      }
+    } else {
+      const big = (BigInt(oldDurHi) << 32n) | BigInt(oldDurLo);
+      const newBig = big * BigInt(mult);
+      writeU32(newPayload, 28, Number((newBig >> 32n) & 0xffffffffn));
+      writeU32(newPayload, 32, Number(newBig & 0xffffffffn));
+    }
+  } else {
+    // v0: duration at offset 20 (4 bytes), after 4 flags + 4 creation + 4 mod + 4 trackID + 4 reserved
+    if (p.length < 24) return;
+    const oldDuration = readU32(p, 20);
+    const newDuration = oldDuration * mult;
+    writeU32(newPayload, 20, newDuration <= 0xffffffff ? newDuration : newDuration >>> 0);
+  }
+  tkhd.payload = newPayload;
+}
+
+/**
+ * Patch elst (Edit List Box) segment_durations by scaling them by `mult`.
+ *
+ * elst.segment_duration is in mvhd.timescale units — same as tkhd.duration.
+ * When we scale mvhd.timescale by `mult`, we must also scale every
+ * segment_duration by `mult` or the edit list will truncate the video to
+ * original_duration / new_timescale seconds.
+ *
+ * elst v0: 4 version/flags + 4 entry_count + N × (4 seg_duration + 4 media_time + 4 rate)
+ * elst v1: 4 version/flags + 4 entry_count + N × (8 seg_duration + 8 media_time + 4 rate)
+ */
+function patchElstDurations(elst: Box, mult: number): void {
+  const p = elst.payload;
+  if (p.length < 8) return;
+  const version = p[0];
+  const entryCount = readU32(p, 4);
+
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+
+  for (let i = 0; i < entryCount; i++) {
+    if (version === 1) {
+      // v1: seg_duration at offset 8 + i*20 (8 bytes)
+      const off = 8 + i * 20;
+      if (off + 8 > p.length) break;
+      const oldLo = readU32(p, off + 4);
+      const oldHi = readU32(p, off);
+      if (oldHi === 0) {
+        const newDur = oldLo * mult;
+        if (newDur > 0xffffffff) {
+          const big = BigInt(oldLo) * BigInt(mult);
+          writeU32(newPayload, off, Number((big >> 32n) & 0xffffffffn));
+          writeU32(newPayload, off + 4, Number(big & 0xffffffffn));
+        } else {
+          writeU32(newPayload, off, 0);
+          writeU32(newPayload, off + 4, newDur);
+        }
+      } else {
+        const big = (BigInt(oldHi) << 32n) | BigInt(oldLo);
+        const newBig = big * BigInt(mult);
+        writeU32(newPayload, off, Number((newBig >> 32n) & 0xffffffffn));
+        writeU32(newPayload, off + 4, Number(newBig & 0xffffffffn));
+      }
+    } else {
+      // v0: seg_duration at offset 8 + i*12 (4 bytes)
+      const off = 8 + i * 12;
+      if (off + 4 > p.length) break;
+      const oldDur = readU32(p, off);
+      const newDur = oldDur * mult;
+      writeU32(newPayload, off, newDur <= 0xffffffff ? newDur : newDur >>> 0);
+    }
+  }
+  elst.payload = newPayload;
 }
 
 /**

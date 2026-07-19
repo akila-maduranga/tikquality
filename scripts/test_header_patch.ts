@@ -76,27 +76,38 @@ console.log(`  Encoder tag: ${afterMeta?.encoderTag}`);
 console.log("\n== Verification ==");
 const checks: { name: string; pass: boolean; detail: string }[] = [];
 
-// 1. mvhd timescale × 19 (read the mvhd directly)
-// We need to parse the mvhd box from the output to check its timescale
+// 1. mvhd timescale AND duration scaled by 19 (read mvhd directly)
 const afterBoxes = parseMP4(result.output);
 const afterMoov = afterBoxes.find(b => b.type === "moov");
 let mvhdTimescale = 0;
+let mvhdDuration = 0;
+let mvhdMovieDurationSec = 0;
 if (afterMoov) {
   const mvhdBox = afterMoov.children.find(c => c.type === "mvhd");
   if (mvhdBox) {
     const p = mvhdBox.payload;
     const version = p[0];
-    if (version === 1 && p.length >= 24) {
+    if (version === 1 && p.length >= 32) {
       mvhdTimescale = readU32(p, 20);
-    } else if (p.length >= 16) {
+      const durLo = readU32(p, 28);
+      const durHi = readU32(p, 24);
+      mvhdDuration = (durHi * 0x100000000) + durLo;
+    } else if (p.length >= 20) {
       mvhdTimescale = readU32(p, 12);
+      mvhdDuration = readU32(p, 16);
     }
+    mvhdMovieDurationSec = mvhdTimescale > 0 ? mvhdDuration / mvhdTimescale : 0;
   }
 }
 checks.push({
   name: "mvhd timescale × 19 (the lie)",
   pass: mvhdTimescale > 0 && mvhdTimescale > (beforeMeta?.timescale ?? 0),
-  detail: `mvhd.timescale=${mvhdTimescale} (mdhd unchanged at ${afterMeta?.timescale})`,
+  detail: `mvhd.timescale=${mvhdTimescale}`,
+});
+checks.push({
+  name: "mvhd movie duration preserved (NOT truncated)",
+  pass: Math.abs(mvhdMovieDurationSec - (beforeMeta?.duration ?? 0)) < 0.1,
+  detail: `movie duration=${mvhdMovieDurationSec.toFixed(3)}s (expected ~${beforeMeta?.duration?.toFixed(3)}s)`,
 });
 
 // 2. Sample count unchanged (no frame duplication)
@@ -113,7 +124,7 @@ checks.push({
   detail: `${beforeMeta?.fps?.toFixed(2)} → ${afterMeta?.fps?.toFixed(2)}`,
 });
 
-// 4. Duration stays the same (mdhd.duration not touched)
+// 4. Media duration stays the same (mdhd.duration not touched)
 checks.push({
   name: "Media duration unchanged",
   pass: Math.abs((afterMeta?.duration ?? 0) - (beforeMeta?.duration ?? 0)) < 0.01,
@@ -184,13 +195,24 @@ try {
   allPass = false;
 }
 
-console.log("\n== ffprobe format info (check mvhd duration mismatch) ==");
+console.log("\n== ffprobe format duration (should match media duration, NOT be truncated) ==");
 try {
   const out = execSync(
-    `ffprobe -v error -show_entries format=duration -show_entries stream=duration -of default=noprint_wrappers=1 ${output}`,
+    `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 ${output}`,
     { encoding: "utf-8", timeout: 10000 },
   );
   console.log(out.trim());
+  const match = out.match(/duration=([\d.]+)/);
+  if (match) {
+    const formatDuration = parseFloat(match[1]);
+    const expected = beforeMeta?.duration ?? 0;
+    if (Math.abs(formatDuration - expected) < 0.5) {
+      console.log(`  ✅ Format duration ${formatDuration.toFixed(3)}s matches media duration (no truncation)`);
+    } else {
+      console.log(`  ❌ Format duration ${formatDuration.toFixed(3)}s != expected ${expected.toFixed(3)}s (VIDEO TRUNCATED)`);
+      allPass = false;
+    }
+  }
 } catch (e) {
   console.log(`  ffprobe format check failed: ${(e as Error).message}`);
 }
