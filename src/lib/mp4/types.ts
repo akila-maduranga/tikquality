@@ -31,7 +31,7 @@ export interface Box {
 }
 
 /** Encoding mode. */
-export type HazeMode = "header_patch" | "frame_inflation";
+export type HazeMode = "header_patch" | "frame_inflation" | "flame_inflation";
 
 /** Options that control haze encoding behaviour. */
 export interface HazeOptions {

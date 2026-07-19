@@ -128,6 +128,9 @@ export async function hazeEncode(
   if (options.mode === "header_patch") {
     return hazeHeaderPatch(data, options, onProgress);
   }
+  if (options.mode === "flame_inflation") {
+    return hazeFlameInflation(data, options, onProgress);
+  }
   return hazeFrameInflation(data, options, onProgress);
 }
 
@@ -1133,4 +1136,201 @@ function setTkhdDimensions(tkhd: Box, width: number, height: number): void {
   writeU32(newPayload, p.length - 8, widthFixed);
   writeU32(newPayload, p.length - 4, heightFixed);
   tkhd.payload = newPayload;
+}
+
+/**
+ * Flame Inflation mode (alternative method).
+ *
+ * Combines sample duplication (multiplying samples per chunk in stsc, duplicating
+ * sample sizes in stsz, keeping stco/co64 offsets unique) with all metadata
+ * patch operations.
+ */
+async function hazeFlameInflation(
+  data: Uint8Array,
+  options: HazeOptions,
+  onProgress?: ProgressCallback,
+): Promise<HazeResult> {
+  const startTime = performance.now();
+  const mult = options.multiplier;
+
+  onProgress?.("Parsing MP4 structure", 5);
+
+  const boxes = parseMP4(data);
+  if (boxes.length === 0) {
+    throw new Error("No MP4 boxes found. Is this a valid MP4 file?");
+  }
+
+  const ftyp = boxes.find((b) => b.type === "ftyp");
+  if (!ftyp) throw new Error("ftyp box not found - not a valid MP4 file.");
+
+  const moov = boxes.find((b) => b.type === "moov");
+  if (!moov) throw new Error("moov box not found - cannot process.");
+
+  const mdat = boxes.find((b) => b.type === "mdat");
+  if (!mdat) throw new Error("mdat box not found - no media data.");
+
+  onProgress?.("Locating video track", 15);
+
+  const videoTrak = findVideoTrack(moov);
+  if (!videoTrak) throw new Error("No video track found in moov.");
+
+  const mdia = findChild(videoTrak, "mdia");
+  if (!mdia) throw new Error("mdia box not found in video track.");
+  const minf = findChild(mdia, "minf");
+  if (!minf) throw new Error("minf box not found in video track.");
+  const stbl = findChild(minf, "stbl");
+  if (!stbl) throw new Error("stbl box not found in video track.");
+
+  // Keyframe guard — same check as frame_inflation
+  if (!options.forceEncode) {
+    const stts = findChild(stbl, "stts");
+    const stss = findChild(stbl, "stss");
+    if (stts) {
+      const sttsPayload = stts.payload;
+      if (sttsPayload.length >= 8) {
+        const entryCount = readU32(sttsPayload, 4);
+        let sampleCount = 0;
+        for (let i = 0; i < entryCount; i++) {
+          const off = 8 + i * 8;
+          if (off + 8 > sttsPayload.length) break;
+          sampleCount += readU32(sttsPayload, off);
+        }
+        const keyframeCount = stss ? readU32(stss.payload, 4) : sampleCount;
+        if (keyframeCount < sampleCount) {
+          throw new HazeKeyframeError(sampleCount, keyframeCount);
+        }
+      }
+    }
+  }
+
+  // Compute mdat offset shift
+  const oldMdatOffset = mdat.fileOffset;
+  const newMdatOffset = ftyp.fileOffset + ftyp.size;
+  const offsetDelta = newMdatOffset - oldMdatOffset;
+
+  onProgress?.("Inflating timescale & sample tables (flame)", 30);
+
+  // 1. Inflate mdhd timescale and duration (requested current modification)
+  inflateMdhd(mdia, mult);
+
+  // 2. Inflate stts sample count
+  const stts = findChild(stbl, "stts");
+  if (stts) {
+    inflateStts(stts, mult);
+  }
+
+  // 3. Inflate ctts sample count if present
+  const ctts = findChild(stbl, "ctts");
+  if (ctts) {
+    inflateCtts(ctts, mult);
+  }
+
+  // 4. Inflate stsc (Sample-to-Chunk): multiply samples_per_chunk
+  const stsc = findChild(stbl, "stsc");
+  if (stsc) {
+    inflateStscFlame(stsc, mult);
+  }
+
+  onProgress?.("Inflating sample sizes (flame)", 45);
+
+  // 5. Inflate stsz (Sample Sizes): repeat each size mult times
+  const stsz = findChild(stbl, "stsz");
+  if (stsz) {
+    inflateStsz(stsz, mult);
+  }
+
+  onProgress?.("Shifting chunk offsets (flame)", 60);
+
+  // 6. Shift stco/co64 chunk offsets by offsetDelta (do NOT duplicate offsets)
+  const stco = findChild(stbl, "stco");
+  if (stco) {
+    shiftStco(stco, offsetDelta);
+  }
+  const co64 = findChild(stbl, "co64");
+  if (co64) {
+    shiftCo64(co64, offsetDelta);
+  }
+
+  // 7. Handle stss/sync samples
+  if (options.dropSyncSamples) {
+    removeChildren(stbl, ["stss", "stps", "sdtp"]);
+  } else {
+    const stss = findChild(stbl, "stss");
+    if (stss) {
+      inflateStss(stss, mult);
+    }
+    removeChildren(stbl, ["sdtp"]);
+  }
+
+  onProgress?.("Writing encoder tag & handler name", 75);
+
+  // 8. Add encoder tag to trak/udta/ilst
+  let udta = findChild(videoTrak, "udta");
+  if (!udta) {
+    udta = makeContainerBox("udta", []);
+    videoTrak.children.push(udta);
+  }
+  setEncoderTag(udta, options.encoderTag);
+
+  // 9. Update handler_name in hdlr
+  const hdlr = findChild(mdia, "hdlr");
+  if (hdlr) {
+    setHandlerName(hdlr, options.handlerName);
+  }
+
+  // 10. Force TikTok 9:16 matrix if enabled
+  if (options.forceTikTok9x16) {
+    const tkhd = findChild(videoTrak, "tkhd");
+    if (tkhd) {
+      setTkhdDimensions(tkhd, options.tikTokWidth, options.tikTokHeight);
+    }
+  }
+
+  onProgress?.("Reordering boxes (moov after mdat)", 85);
+
+  // 11. Reorder top-level boxes: [ftyp] [mdat] [moov]
+  const reordered: Box[] = [];
+  reordered.push(ftyp);
+  reordered.push(mdat);
+  for (const b of boxes) {
+    if (b.type !== "ftyp" && b.type !== "mdat") {
+      reordered.push(b);
+    }
+  }
+
+  onProgress?.("Serializing output", 95);
+
+  const output = writeMP4(reordered);
+  const elapsedMs = performance.now() - startTime;
+  onProgress?.("Done", 100);
+
+  return {
+    output,
+    inputSize: data.length,
+    outputSize: output.length,
+    elapsedMs,
+  };
+}
+
+/**
+ * Inflate stsc by multiplying samples_per_chunk by mult.
+ */
+function inflateStscFlame(stsc: Box, mult: number): void {
+  const p = stsc.payload;
+  if (p.length < 8) return;
+  const entryCount = readU32(p, 4);
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+  for (let i = 0; i < entryCount; i++) {
+    const off = 8 + i * 12;
+    if (off + 12 > p.length) break;
+    const samplesPer = readU32(p, off + 4);
+    const newSamplesPer = samplesPer * mult;
+    writeU32(
+      newPayload,
+      off + 4,
+      newSamplesPer <= 0xffffffff ? newSamplesPer : newSamplesPer >>> 0,
+    );
+  }
+  stsc.payload = newPayload;
 }

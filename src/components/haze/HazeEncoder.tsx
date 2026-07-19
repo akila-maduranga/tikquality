@@ -135,10 +135,10 @@ export function HazeEncoder() {
       let inputBuffer = new Uint8Array(await file.arrayBuffer());
       let inputMeta = originalMeta;
 
-      // Stage 1: auto-preprocess to all-I-frame if needed (frame_inflation mode only)
+      // Stage 1: auto-preprocess to all-I-frame if needed (frame_inflation / flame_inflation modes)
       // Header Patch mode doesn't need pre-processing — it doesn't touch sample tables.
       const needsPreprocess =
-        options.mode === "frame_inflation" &&
+        (options.mode === "frame_inflation" || options.mode === "flame_inflation") &&
         options.autoPreprocess &&
         inputMeta &&
         !inputMeta.allKeyframes;
@@ -478,11 +478,11 @@ export function HazeEncoder() {
               </Alert>
             )}
 
-            {originalMeta && !originalMeta.allKeyframes && !keyframeError && options.mode === "frame_inflation" && (
+            {originalMeta && !originalMeta.allKeyframes && !keyframeError && (options.mode === "frame_inflation" || options.mode === "flame_inflation") && (
               <Alert className="mt-4 border-amber-500/50 bg-amber-500/5 text-amber-900 dark:text-amber-100">
                 <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
                 <AlertDescription className="text-xs">
-                  This video has P/B-frames. Frame Inflation mode will refuse
+                  This video has P/B-frames. Inflation mode will refuse
                   to produce a corrupted output — either pre-process to all-I-frame
                   first, enable <span className="font-semibold">Auto-convert</span>{" "}
                   below, or switch to <span className="font-semibold">Header Patch</span>{" "}
@@ -521,7 +521,7 @@ export function HazeEncoder() {
               {/* Mode selector */}
               <div className="space-y-2">
                 <Label className="text-base">Encoding mode</Label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <button
                     type="button"
                     onClick={() =>
@@ -568,6 +568,28 @@ export function HazeEncoder() {
                       Original method. Duplicates sample tables to show 19× FPS
                       in ffprobe. Requires all-I-frame input (auto-preprocess
                       available).
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOptions((o) => ({ ...o, mode: "flame_inflation" }))
+                    }
+                    className={`text-left rounded-lg border p-3 transition-colors ${
+                      options.mode === "flame_inflation"
+                        ? "border-amber-500 bg-amber-500/5"
+                        : "border-border hover:border-muted-foreground/50"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <Zap className="h-4 w-4 text-amber-500" />
+                      <span className="font-medium text-sm">
+                        Flame Inflation
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Alternative method. Multiplies samples per chunk in stsc
+                      without duplicating chunk offsets. Requires all-I-frame.
                     </p>
                   </button>
                 </div>
@@ -683,7 +705,7 @@ export function HazeEncoder() {
                     }
                   />
                 </div>
-                {options.mode === "frame_inflation" && (
+                {(options.mode === "frame_inflation" || options.mode === "flame_inflation") && (
                   <div className="flex items-center justify-between rounded-lg border p-3">
                     <div className="space-y-0.5">
                       <Label htmlFor="dropSync" className="text-base">
@@ -704,7 +726,7 @@ export function HazeEncoder() {
                     />
                   </div>
                 )}
-                {options.mode === "frame_inflation" && (
+                {(options.mode === "frame_inflation" || options.mode === "flame_inflation") && (
                   <div
                     className={`flex items-center justify-between rounded-lg border p-3 ${
                       options.autoPreprocess
@@ -733,7 +755,7 @@ export function HazeEncoder() {
                     />
                   </div>
                 )}
-                {options.mode === "frame_inflation" && (
+                {(options.mode === "frame_inflation" || options.mode === "flame_inflation") && (
                   <div
                     className={`flex items-center justify-between rounded-lg border p-3 ${
                       options.forceEncode
