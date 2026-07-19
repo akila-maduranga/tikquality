@@ -248,6 +248,22 @@ async function hazeHeaderPatch(
     if (co64) shiftAndInflateCo64(co64, offsetDelta, mult);
   }
 
+  // Also shift stco/co64 for ALL other tracks (e.g. audio) — box reordering
+  // moves mdat before moov, shifting every chunk offset by offsetDelta.
+  for (const otherTrak of moov.children) {
+    if (otherTrak.type !== "trak" || otherTrak === videoTrak) continue;
+    const otherMdia = findChild(otherTrak, "mdia");
+    if (!otherMdia) continue;
+    const otherMinf = findChild(otherMdia, "minf");
+    if (!otherMinf) continue;
+    const otherStbl = findChild(otherMinf, "stbl");
+    if (!otherStbl) continue;
+    const otherStco = findChild(otherStbl, "stco");
+    if (otherStco) shiftStco(otherStco, offsetDelta);
+    const otherCo64 = findChild(otherStbl, "co64");
+    if (otherCo64) shiftCo64(otherCo64, offsetDelta);
+  }
+
   // Step 4: Set encoder tag & handler name
   onProgress?.("Writing encoder tag & handler name", 60);
   let udta = findChild(videoTrak, "udta");
@@ -1365,7 +1381,7 @@ function inflateStblPythonStyle(
   const chunkCount = stco
     ? readU32(stco.payload, 4)
     : co64
-      ? Number(readU64(co64.payload, 4))
+      ? readU32(co64.payload, 4)
       : 0;
   if (stsz && stsc && chunkCount > 0) {
     inflateStszByChunk(stsz, stsc, chunkCount, mult);
