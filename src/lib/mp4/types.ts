@@ -31,7 +31,7 @@ export interface Box {
 }
 
 /** Encoding mode. */
-export type HazeMode = "header_patch" | "frame_inflation";
+export type HazeMode = "header_patch" | "frame_inflation" | "flame_inflation" | "itsscale";
 
 /** Options that control haze encoding behaviour. */
 export interface HazeOptions {
@@ -45,6 +45,10 @@ export interface HazeOptions {
    * - "frame_inflation": Original haze method. Duplicates stco/stsz entries to
    *   physically declare 19× more frames. FPS in ffprobe shows 19×. Requires
    *   all-I-frame input (P-frames would compound deltas and corrupt).
+   * - "itsscale": Uses ffmpeg -itsscale to rescale input timestamps, then
+   *   stream-copies audio and video. Creates a timestamp mismatch that tricks
+   *   TikTok's parser into passthrough. Metadata (encoder tag, handler name,
+   *   TikTok 9:16) is injected after the ffmpeg pass. Requires ffmpeg.wasm.
    */
   mode: HazeMode;
   /** Internal frame multiplier. Default 19 (matches haze_encode.sh). */

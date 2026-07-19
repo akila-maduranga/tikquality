@@ -8,7 +8,7 @@
  *   1. Patch mvhd timescale and duration by mult — the "lie" that tricks
  *      TikTok's ingest parser into passthrough mode (non-standard timescale).
  *   2. Patch tkhd/elst durations by mult to keep real-time playback correct.
- *   3. Inflate mdhd timescale and duration by mult for consistent timescale.
+ *   3. Inflate mdhd timescale and duration by mult for consistent media timescale.
  *   4. Inflate sample tables to declare mult× more frames:
  *      - stts sample_count × mult (delta unchanged)
  *      - stco/co64 entries duplicated × mult (each virtual chunk → same data)
@@ -18,9 +18,18 @@
  *   5. Inflate ctts sample_count × mult (if present).
  *   6. Write encoder tag, handler name, optional TikTok 9:16 dimensions.
  *
+ * ITSSCALE MODE (simplest):
+ *   Uses ffmpeg -itsscale to rescale input timestamps, then stream-copies.
+ *   Creates a timestamp mismatch that tricks TikTok's parser into passthrough.
+ *   Metadata (encoder tag, handler name, TikTok 9:16) is injected after.
+ *
  * FRAME INFLATION MODE (original):
  *   Duplicates stco/stsz entries to declare mult× more frames. FPS in ffprobe
  *   shows mult× original. Requires all-I-frame input.
+ *
+ * FLAME INFLATION MODE (alternative):
+ *   Multiplies samples_per_chunk in stsc, duplicates stsz, shifts stco without
+ *   duplicating. Requires all-I-frame input.
  *
  * @see src/lib/mp4/hazeEncoder.ts — inline comments reference the Python
  *      implementation in inflate_frames_mp4.py for the sample table inflation.
@@ -108,6 +117,12 @@ export async function hazeEncode(
 ): Promise<HazeResult> {
   if (options.mode === "header_patch") {
     return hazeHeaderPatch(data, options, onProgress);
+  }
+  if (options.mode === "itsscale") {
+    return hazeItsscale(data, options, onProgress);
+  }
+  if (options.mode === "flame_inflation") {
+    return hazeFlameInflation(data, options, onProgress);
   }
   return hazeFrameInflation(data, options, onProgress);
 }
@@ -700,6 +715,103 @@ async function hazeFrameInflation(
   onProgress?.("Serializing output", 95);
 
   // Step 15: Serialize
+  const output = writeMP4(reordered);
+
+  const elapsedMs = performance.now() - startTime;
+  onProgress?.("Done", 100);
+
+  return {
+    output,
+    inputSize: data.length,
+    outputSize: output.length,
+    elapsedMs,
+  };
+}
+
+// ============================================================================
+// Itsscale mode (ffmpeg -itsscale + metadata injection)
+// ============================================================================
+
+/**
+ * Itsscale mode.
+ *
+ * The input data has ALREADY been processed by ffmpeg with -itsscale to rescale
+ * timestamps (creating the FPS mismatch that tricks TikTok). This function
+ * applies metadata-only patches on top: encoder tag, handler name, and optional
+ * TikTok 9:16 dimensions.
+ *
+ * This is the simplest mode — ffmpeg handles all the complex timestamp/sample
+ * table manipulation. We only inject cosmetic metadata.
+ */
+async function hazeItsscale(
+  data: Uint8Array,
+  options: HazeOptions,
+  onProgress?: ProgressCallback,
+): Promise<HazeResult> {
+  const startTime = performance.now();
+
+  onProgress?.("Parsing MP4 structure", 5);
+
+  const boxes = parseMP4(data);
+  if (boxes.length === 0) {
+    throw new Error("No MP4 boxes found. Is this a valid MP4 file?");
+  }
+
+  const moov = boxes.find((b) => b.type === "moov");
+  if (!moov) throw new Error("moov box not found - cannot process.");
+
+  onProgress?.("Locating video track", 15);
+
+  const videoTrak = findVideoTrack(moov);
+  if (!videoTrak) throw new Error("No video track found in moov.");
+
+  const mdia = findChild(videoTrak, "mdia");
+  if (!mdia) throw new Error("mdia box not found in video track.");
+
+  onProgress?.("Injecting metadata", 40);
+
+  // Step 1: Add encoder tag to trak/udta/ilst
+  let udta = findChild(videoTrak, "udta");
+  if (!udta) {
+    udta = makeContainerBox("udta", []);
+    videoTrak.children.push(udta);
+  }
+  setEncoderTag(udta, options.encoderTag);
+
+  // Step 2: Update handler_name in hdlr
+  const hdlr = findChild(mdia, "hdlr");
+  if (hdlr) {
+    setHandlerName(hdlr, options.handlerName);
+  }
+
+  // Step 3: Optionally force TikTok 9:16 dimensions in tkhd
+  if (options.forceTikTok9x16) {
+    const tkhd = findChild(videoTrak, "tkhd");
+    if (tkhd) {
+      setTkhdDimensions(tkhd, options.tikTokWidth, options.tikTokHeight);
+    }
+  }
+
+  onProgress?.("Reordering boxes (moov after mdat)", 80);
+
+  // Step 4: Reorder top-level boxes — [ftyp] [mdat] [moov]
+  const ftyp = boxes.find((b) => b.type === "ftyp");
+  const mdat = boxes.find((b) => b.type === "mdat");
+
+  let reordered: Box[];
+  if (ftyp && mdat) {
+    reordered = [ftyp, mdat];
+    for (const b of boxes) {
+      if (b.type !== "ftyp" && b.type !== "mdat") {
+        reordered.push(b);
+      }
+    }
+  } else {
+    reordered = boxes;
+  }
+
+  onProgress?.("Serializing output", 95);
+
   const output = writeMP4(reordered);
 
   const elapsedMs = performance.now() - startTime;

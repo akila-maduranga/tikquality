@@ -44,6 +44,21 @@ export interface UseFfmpegResult {
     onProgress?: (p: FfmpegProgress) => void,
     onLog?: (message: string) => void,
   ) => Promise<Uint8Array>;
+  /**
+   * Apply ffmpeg -itsscale to rescale input timestamps, then stream-copy.
+   *
+   * @param file Input video File or Uint8Array
+   * @param scale The -itsscale factor (e.g. 2 for 60fps, 6 for 120fps, 12 for 240fps)
+   * @param onProgress Optional progress callback
+   * @param onLog Optional log callback
+   * @returns Output MP4 as Uint8Array
+   */
+  applyItsscale: (
+    file: File | Uint8Array,
+    scale: number,
+    onProgress?: (p: FfmpegProgress) => void,
+    onLog?: (message: string) => void,
+  ) => Promise<Uint8Array>;
 }
 
 // CDN URLs for the ffmpeg-core single-threaded build.
@@ -195,11 +210,89 @@ export function useFfmpeg(): UseFfmpegResult {
     };
   }, []);
 
+  const applyItsscale = useCallback(
+    async (
+      file: File | Uint8Array,
+      scale: number,
+      onProgress?: (p: FfmpegProgress) => void,
+      onLog?: (message: string) => void,
+    ): Promise<Uint8Array> => {
+      const ffmpeg = await load();
+      if (!ffmpeg) {
+        throw new Error("ffmpeg not loaded");
+      }
+
+      const progressHandler = (p: FfmpegProgress) => onProgress?.(p);
+      const logHandler = (e: { message: string }) => onLog?.(e.message);
+      ffmpeg.on("progress", progressHandler);
+      ffmpeg.on("log", logHandler);
+
+      try {
+        const inputFile =
+          file instanceof Uint8Array
+            ? new Blob([file as BlobPart], { type: "video/mp4" })
+            : file;
+        const inputData = await fetchFile(inputFile);
+        await ffmpeg.writeFile("input.mp4", inputData);
+
+        const logMessages: string[] = [];
+        const logCollector = (e: { message: string }) => {
+          logMessages.push(e.message);
+          onLog?.(e.message);
+        };
+        ffmpeg.on("log", logCollector);
+
+        // -itsscale <scale>: rescale input timestamps by the given factor.
+        // -c copy: stream-copy audio and video (no re-encoding).
+        // This creates a duration/timestamp mismatch that tricks TikTok's
+        // ingest parser into passthrough mode.
+        const exitCode = await ffmpeg.exec([
+          "-y",
+          "-itsscale",
+          String(scale),
+          "-i",
+          "input.mp4",
+          "-c:v",
+          "copy",
+          "-c:a",
+          "copy",
+          "output.mp4",
+        ]);
+
+        if (exitCode !== 0) {
+          const recentLogs = logMessages.slice(-30).join("\n");
+          throw new Error(
+            `ffmpeg exited with code ${exitCode}. Recent log:\n${recentLogs}`,
+          );
+        }
+
+        const outputData = await ffmpeg.readFile("output.mp4");
+        try {
+          await ffmpeg.deleteFile("input.mp4");
+          await ffmpeg.deleteFile("output.mp4");
+        } catch {
+          // Ignore cleanup errors
+        }
+        ffmpeg.off("log", logCollector);
+
+        if (typeof outputData === "string") {
+          throw new Error("Unexpected string output from ffmpeg");
+        }
+        return outputData as Uint8Array;
+      } finally {
+        ffmpeg.off("progress", progressHandler);
+        ffmpeg.off("log", logHandler);
+      }
+    },
+    [load],
+  );
+
   return {
     state,
     error,
     ffmpeg: ffmpegRef.current,
     load,
     convertToAllIFrames,
+    applyItsscale,
   };
 }

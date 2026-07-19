@@ -191,15 +191,54 @@ export function HazeEncoder() {
       // If autoPreprocess ran, forceEncode is effectively true now (input is all-I-frame).
       // If autoPreprocess is off but forceEncode is on, just call hazeEncode with forceEncode.
       // If both are off and input has P/B-frames, hazeEncode will throw HazeKeyframeError.
+      let hazeInput = inputBuffer;
+
+      if (options.mode === "itsscale") {
+        // Itsscale mode: first run ffmpeg -itsscale, then inject metadata.
+        setProgress({ stage: "Loading ffmpeg.wasm (one-time, ~30MB)", percent: 5 });
+        const itsscaleStart = performance.now();
+
+        const scaledBuffer = await ffmpeg.applyItsscale(
+          inputBuffer,
+          options.multiplier,
+          (p) => {
+            const pct = Math.min(70, Math.max(10, 10 + p.progress * 60));
+            setProgress({
+              stage: `Applying -itsscale ${options.multiplier} with ffmpeg.wasm (${(p.progress * 100).toFixed(0)}%)`,
+              percent: Math.round(pct),
+            });
+          },
+          (msg) => {
+            if (msg && !msg.startsWith("frame=")) {
+              // Could store in state if we want to show logs
+            }
+          },
+        );
+
+        const itsscaleElapsed = performance.now() - itsscaleStart;
+        setPreprocessInfo({
+          originalSize: inputBuffer.length,
+          preprocessedSize: scaledBuffer.length,
+          preprocessedMeta: readMetadata(
+            parseMP4(scaledBuffer),
+            scaledBuffer.length,
+          ),
+          elapsedMs: itsscaleElapsed,
+        });
+
+        hazeInput = scaledBuffer;
+        setProgress({ stage: "Itsscale applied, injecting metadata…", percent: 75 });
+      }
+
       const hazeOptions: HazeOptions = {
         ...options,
-        // If we preprocessed, force the encode flag on so the guard doesn't trip
+        // If we preprocessed (frame_inflation/flame), force the encode flag on
         forceEncode: needsPreprocess ? true : options.forceEncode,
       };
 
-      const result = await hazeEncode(inputBuffer, hazeOptions, (stage, percent) => {
+      const result = await hazeEncode(hazeInput, hazeOptions, (stage, percent) => {
         // Map haze encode progress to 75..100 if we preprocessed, else 0..100
-        const mapped = needsPreprocess
+        const mapped = needsPreprocess || options.mode === "itsscale"
           ? 75 + Math.round((percent / 100) * 25)
           : percent;
         setProgress({ stage, percent: mapped });
@@ -501,6 +540,19 @@ export function HazeEncoder() {
                 </AlertDescription>
               </Alert>
             )}
+
+            {originalMeta && options.mode === "itsscale" && (
+              <Alert className="mt-4 border-blue-500/50 bg-blue-500/5 text-blue-900 dark:text-blue-100">
+                <CheckCircle2 className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+                <AlertDescription className="text-xs">
+                  <span className="font-semibold">Itsscale</span>{" "}
+                  mode uses <code className="font-mono">ffmpeg -itsscale</code>{" "}
+                  with stream copy — no re-encoding, works with any input including
+                  P/B-frames. Encoder tag and TikTok 9:16 are injected after the
+                  ffmpeg pass. Requires ffmpeg.wasm (~30MB first load).
+                </AlertDescription>
+              </Alert>
+            )}
           </CardContent>
         </Card>
 
@@ -521,7 +573,7 @@ export function HazeEncoder() {
               {/* Mode selector */}
               <div className="space-y-2">
                 <Label className="text-base">Encoding mode</Label>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   <button
                     type="button"
                     onClick={() =>
@@ -592,6 +644,32 @@ export function HazeEncoder() {
                       without duplicating chunk offsets. Requires all-I-frame.
                     </p>
                   </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOptions((o) => ({ ...o, mode: "itsscale" }))
+                    }
+                    className={`text-left rounded-lg border p-3 transition-colors ${
+                      options.mode === "itsscale"
+                        ? "border-blue-500 bg-blue-500/5"
+                        : "border-border hover:border-muted-foreground/50"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <Clock className="h-4 w-4 text-blue-500" />
+                      <span className="font-medium text-sm">
+                        Itsscale
+                      </span>
+                      <Badge variant="secondary" className="ml-auto text-xs">
+                        Simplest
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Uses ffmpeg -itsscale to rescale timestamps, then
+                      stream-copies. Injects encoder tag + TikTok 9:16 on top.
+                      Requires ffmpeg.wasm.
+                    </p>
+                  </button>
                 </div>
               </div>
 
@@ -603,7 +681,9 @@ export function HazeEncoder() {
                   <Label htmlFor="multiplier" className="text-base">
                     {options.mode === "header_patch"
                       ? "Timescale multiplier"
-                      : "Frame multiplier (flame inflation)"}
+                      : options.mode === "itsscale"
+                        ? "Timestamp scale factor"
+                        : "Frame multiplier (flame inflation)"}
                   </Label>
                   <Badge variant="secondary" className="font-mono text-base">
                     ×{options.multiplier}
@@ -625,6 +705,13 @@ export function HazeEncoder() {
                       Multiplies <code className="font-mono">mvhd.timescale</code>{" "}
                       by this factor, creating a duration mismatch that tricks
                       TikTok's ingest parser into passthrough mode.
+                    </>
+                  ) : options.mode === "itsscale" ? (
+                    <>
+                      Passed to <code className="font-mono">ffmpeg -itsscale</code>{" "}
+                      to rescale input timestamps by this factor, creating a
+                      timestamp mismatch that tricks TikTok into passthrough.
+                      Use 2 for 60fps, 6 for 120fps, 12 for 240fps targets.
                     </>
                   ) : (
                     <>
