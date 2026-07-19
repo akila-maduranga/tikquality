@@ -53,6 +53,13 @@ export interface HazeOptions {
    * the encoder throws when the input is not all-I-frame.
    */
   forceEncode: boolean;
+  /**
+   * When true, automatically pre-process the input with ffmpeg.wasm to
+   * all-I-frame before haze encoding. This produces an artifact-free output
+   * for any input. Takes precedence over forceEncode (if both are true,
+   * autoPreprocess wins and no error is thrown). Defaults to true.
+   */
+  autoPreprocess: boolean;
 }
 
 export const DEFAULT_OPTIONS: HazeOptions = {
@@ -64,6 +71,7 @@ export const DEFAULT_OPTIONS: HazeOptions = {
   tikTokHeight: 1920,
   dropSyncSamples: true,
   forceEncode: false,
+  autoPreprocess: true,
 };
 
 /** Snapshot of the metadata we report to the UI before/after encoding. */

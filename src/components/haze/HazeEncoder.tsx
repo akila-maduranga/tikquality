@@ -50,10 +50,18 @@ import {
   parseMP4,
   readMetadata,
 } from "@/lib/mp4";
+import { useFfmpeg } from "@/hooks/use-ffmpeg";
 
 interface ProgressState {
   stage: string;
   percent: number;
+}
+
+interface PreprocessInfo {
+  originalSize: number;
+  preprocessedSize: number;
+  preprocessedMeta: VideoMetadata | null;
+  elapsedMs: number;
 }
 
 export function HazeEncoder() {
@@ -72,9 +80,11 @@ export function HazeEncoder() {
   const [error, setError] = useState<string | null>(null);
   const [keyframeError, setKeyframeError] = useState<HazeKeyframeError | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
+  const [preprocessInfo, setPreprocessInfo] = useState<PreprocessInfo | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [copied, setCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const ffmpeg = useFfmpeg();
 
   const handleFile = useCallback(async (file: File) => {
     setFile(file);
@@ -85,6 +95,7 @@ export function HazeEncoder() {
     setEncodedMeta(null);
     setElapsedMs(null);
     setOriginalMeta(null);
+    setPreprocessInfo(null);
 
     if (!file.type.startsWith("video/") && !file.name.toLowerCase().endsWith(".mp4")) {
       setError("Please select an MP4 video file.");
@@ -118,11 +129,78 @@ export function HazeEncoder() {
     setOutputBlob(null);
     setOutputUrl(null);
     setEncodedMeta(null);
+    setPreprocessInfo(null);
 
     try {
-      const buffer = new Uint8Array(await file.arrayBuffer());
-      const result = await hazeEncode(buffer, options, (stage, percent) => {
-        setProgress({ stage, percent });
+      let inputBuffer = new Uint8Array(await file.arrayBuffer());
+      let inputMeta = originalMeta;
+
+      // Stage 1: auto-preprocess to all-I-frame if needed (and enabled)
+      const needsPreprocess =
+        options.autoPreprocess &&
+        inputMeta &&
+        !inputMeta.allKeyframes;
+
+      if (needsPreprocess) {
+        setProgress({ stage: "Loading ffmpeg.wasm (one-time, ~30MB)", percent: 5 });
+        const preprocStart = performance.now();
+
+        // Convert to all-I-frame using ffmpeg.wasm
+        const preprocBuffer = await ffmpeg.convertToAllIFrames(
+          inputBuffer,
+          (p) => {
+            // ffmpeg progress is 0..1 over the encoding duration
+            // Map to 10..70 percent (preprocess stage)
+            const pct = Math.min(70, Math.max(10, 10 + p.progress * 60));
+            setProgress({
+              stage: `Converting to all-I-frame with ffmpeg.wasm (${(p.progress * 100).toFixed(0)}%)`,
+              percent: Math.round(pct),
+            });
+          },
+          (msg) => {
+            // Optionally surface ffmpeg log messages
+            if (msg && !msg.startsWith("frame=")) {
+              // Could store in state if we want to show logs
+            }
+          },
+        );
+
+        const preprocElapsed = performance.now() - preprocStart;
+        const preprocMeta = readMetadata(
+          parseMP4(preprocBuffer),
+          preprocBuffer.length,
+        );
+
+        setPreprocessInfo({
+          originalSize: inputBuffer.length,
+          preprocessedSize: preprocBuffer.length,
+          preprocessedMeta: preprocMeta,
+          elapsedMs: preprocElapsed,
+        });
+
+        // Use the preprocessed buffer for haze encoding
+        inputBuffer = preprocBuffer;
+        inputMeta = preprocMeta;
+
+        setProgress({ stage: "All-I-frame conversion complete", percent: 75 });
+      }
+
+      // Stage 2: haze encode (metadata only)
+      // If autoPreprocess ran, forceEncode is effectively true now (input is all-I-frame).
+      // If autoPreprocess is off but forceEncode is on, just call hazeEncode with forceEncode.
+      // If both are off and input has P/B-frames, hazeEncode will throw HazeKeyframeError.
+      const hazeOptions: HazeOptions = {
+        ...options,
+        // If we preprocessed, force the encode flag on so the guard doesn't trip
+        forceEncode: needsPreprocess ? true : options.forceEncode,
+      };
+
+      const result = await hazeEncode(inputBuffer, hazeOptions, (stage, percent) => {
+        // Map haze encode progress to 75..100 if we preprocessed, else 0..100
+        const mapped = needsPreprocess
+          ? 75 + Math.round((percent / 100) * 25)
+          : percent;
+        setProgress({ stage, percent: mapped });
       });
 
       const blob = new Blob([result.output as BlobPart], { type: "video/mp4" });
@@ -143,7 +221,7 @@ export function HazeEncoder() {
     } finally {
       setIsProcessing(false);
     }
-  }, [file, options]);
+  }, [file, options, originalMeta, ffmpeg]);
 
   const copyFfmpegCommand = useCallback(() => {
     const cmd =
@@ -539,10 +617,37 @@ export function HazeEncoder() {
                 </div>
                 <div
                   className={`flex items-center justify-between rounded-lg border p-3 ${
-                    options.forceEncode
-                      ? "border-amber-500/50 bg-amber-500/5"
+                    options.autoPreprocess
+                      ? "border-emerald-500/50 bg-emerald-500/5"
                       : ""
                   }`}
+                >
+                  <div className="space-y-0.5">
+                    <Label htmlFor="autoPreprocess" className="text-base flex items-center gap-1.5">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                      Auto-convert to all-I-frame (recommended)
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Uses ffmpeg.wasm to convert P/B-frame inputs to all-I-frame
+                      before haze encoding. First run downloads ~30MB. Produces
+                      artifact-free output for any input.
+                    </p>
+                  </div>
+                  <Switch
+                    id="autoPreprocess"
+                    checked={options.autoPreprocess}
+                    onCheckedChange={(v) => {
+                      setOptions((o) => ({ ...o, autoPreprocess: v }));
+                      setKeyframeError(null);
+                    }}
+                  />
+                </div>
+                <div
+                  className={`flex items-center justify-between rounded-lg border p-3 ${
+                    options.forceEncode
+                      ? "border-amber-500/50 bg-amber-500/5"
+                      : "opacity-60"
+                  } ${options.autoPreprocess ? "pointer-events-none" : ""}`}
                 >
                   <div className="space-y-0.5">
                     <Label htmlFor="forceEncode" className="text-base flex items-center gap-1.5">
@@ -550,14 +655,15 @@ export function HazeEncoder() {
                       Force encode (P/B-frame input)
                     </Label>
                     <p className="text-xs text-muted-foreground">
-                      Encode even when the input has P/B-frames. The metadata
-                      will report 19× FPS, but the video will have visible
-                      artifacts from compounding P-frame deltas.
+                      {options.autoPreprocess
+                        ? "Disabled — auto-convert is on, which produces clean output."
+                        : "Encode even when the input has P/B-frames. The metadata will report 19× FPS, but the video will have visible artifacts from compounding P-frame deltas."}
                     </p>
                   </div>
                   <Switch
                     id="forceEncode"
                     checked={options.forceEncode}
+                    disabled={options.autoPreprocess}
                     onCheckedChange={(v) => {
                       setOptions((o) => ({ ...o, forceEncode: v }));
                       setKeyframeError(null);
@@ -631,6 +737,43 @@ export function HazeEncoder() {
                       <span className="font-mono">
                         {originalMeta.moovAtEnd ? "end (no faststart)" : "start (faststart)"}
                       </span>
+                    </div>
+                  </>
+                )}
+                {preprocessInfo && (
+                  <>
+                    <div className="border-t pt-2 mt-2">
+                      <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-400 mb-1.5">
+                        <CheckCircle2 className="h-3 w-3" />
+                        Auto-preprocessed to all-I-frame
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Before</span>
+                        <span className="font-mono">
+                          {formatBytes(preprocessInfo.originalSize)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">After</span>
+                        <span className="font-mono">
+                          {formatBytes(preprocessInfo.preprocessedSize)}
+                        </span>
+                      </div>
+                      {preprocessInfo.preprocessedMeta && (
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Keyframes</span>
+                          <span className="font-mono text-emerald-600 dark:text-emerald-400">
+                            {preprocessInfo.preprocessedMeta.keyframeCount}/
+                            {preprocessInfo.preprocessedMeta.sampleCount} ✓
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Preproc time</span>
+                        <span className="font-mono">
+                          {(preprocessInfo.elapsedMs / 1000).toFixed(2)}s
+                        </span>
+                      </div>
                     </div>
                   </>
                 )}
@@ -779,19 +922,30 @@ export function HazeEncoder() {
                 overwritten to 1080×1920 (TikTok 9:16).
               </li>
             </ul>
-            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 my-3">
-              <p className="text-sm font-semibold text-amber-900 dark:text-amber-100 mb-1 flex items-center gap-1.5">
-                <AlertTriangle className="h-4 w-4" />
-                Important: input must be all-I-frame
+            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 my-3">
+              <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-100 mb-1 flex items-center gap-1.5">
+                <CheckCircle2 className="h-4 w-4" />
+                Auto-preprocess to all-I-frame (default ON)
               </p>
-              <p className="text-xs text-amber-900 dark:text-amber-100">
-                Because haze encoding duplicates samples by pointing multiple
+              <p className="text-xs text-emerald-900 dark:text-emerald-100">
+                Haze encoding duplicates samples by pointing multiple
                 <code className="font-mono mx-1">stco</code>
-                entries at the same byte offset, P-frames would have their motion
-                delta compounded 19× (producing visible corruption). Pre-process
-                your video to all-I-frame first:
+                entries at the same byte offset. For I-frames this produces 19
+                identical frames (correct). For P-frames, the same motion delta
+                is applied 19× in a row, producing visible corruption.
               </p>
-              <code className="block font-mono text-xs mt-2 break-all text-amber-900 dark:text-amber-100">
+              <p className="text-xs text-emerald-900 dark:text-emerald-100 mt-2">
+                <span className="font-semibold">When auto-preprocess is ON</span>{" "}
+                (default), the app uses ffmpeg.wasm to convert any P/B-frame
+                input to all-I-frame before haze encoding — produces
+                artifact-free output for any input. First run downloads ~30MB
+                (cached for subsequent runs).
+              </p>
+              <p className="text-xs text-emerald-900 dark:text-emerald-100 mt-2">
+                <span className="font-semibold">When OFF</span>, you must
+                pre-process manually with ffmpeg:
+              </p>
+              <code className="block font-mono text-xs mt-1 break-all text-emerald-900 dark:text-emerald-100">
                 ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4
               </code>
             </div>

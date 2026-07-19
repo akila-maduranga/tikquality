@@ -14,22 +14,26 @@ a single frame. A 1080×1920 5s MP4 encodes in ~4ms.
 - **Custom encoder tag** — written to `©too` atom in `trak/udta/ilst`
 - **TikTok 9:16** — `tkhd` width/height forced to 1080×1920
 - **4K ready** — pure metadata processing, no upload, no re-encoding
-- **No ffmpeg** — pure TypeScript MP4 parser/writer
-- **P/B-frame guard** — refuses to encode P/B-frame inputs (which would produce corrupted output) and shows the ffmpeg command to pre-process to all-I-frame
+- **No ffmpeg required from the user** — pure TypeScript MP4 parser/writer for the haze encode, ffmpeg.wasm (loaded on-demand) for the optional auto-preprocess
+- **Auto-preprocess to all-I-frame** — uses ffmpeg.wasm to convert any P/B-frame input to all-I-frame before haze encoding, producing artifact-free output (default ON)
+- **P/B-frame guard** — when auto-preprocess is OFF, refuses to encode P/B-frame inputs and shows the ffmpeg command to pre-process manually
 
-## ⚠️ Important: Input must be all-I-frame
+## How it works (two-stage pipeline)
 
-Because haze encoding duplicates samples by pointing multiple `stco` entries at the same byte offset, **P-frames would have their motion delta compounded 19×** (producing visible corruption). The encoder detects this via `stss` and refuses to encode — you'll see a clear error with the ffmpeg command to fix it.
+1. **Auto-preprocess (default ON)**: If the input has P/B-frames, ffmpeg.wasm converts it to all-I-frame using `ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 -an output.mp4`. First run downloads ~30MB (cached for subsequent runs).
+2. **Haze encode (metadata only)**: Rewrites the MP4 metadata boxes to inflate FPS 19×, disable faststart, embed encoder tag, and force TikTok 9:16 — all without re-encoding a single frame.
 
-Pre-process your video to all-I-frame before uploading:
+The output is a valid MP4 that plays without corruption: all frames decode cleanly, the FPS shows as 19× in file info, and the moov atom is at the end (faststart OFF).
 
+## ⚠️ Why all-I-frame is required
+
+Because haze encoding duplicates samples by pointing multiple `stco` entries at the same byte offset, **P-frames would have their motion delta compounded 19×** (producing visible corruption). The auto-preprocess stage solves this by converting to all-I-frame first.
+
+If you turn auto-preprocess OFF, you must pre-process manually:
 ```bash
 ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4
 ```
-
-Then upload `all_iframes.mp4` to the Haze Encoder.
-
-If you want to encode a P-frame input anyway (e.g., you only care about the metadata FPS and accept visual artifacts), enable **"Force encode (P/B-frame input)"** in the options.
+Then upload `all_iframes.mp4`. Or enable "Force encode" (produces 19× FPS metadata but with visual artifacts).
 
 ## Tech Stack
 
