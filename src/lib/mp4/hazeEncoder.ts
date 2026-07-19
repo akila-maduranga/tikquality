@@ -2,47 +2,29 @@
  * Haze encoder.
  *
  * Performs metadata-level haze encoding on an MP4 file without re-encoding the
- * video/audio data. The transformations applied:
+ * video/audio data.
  *
- *   1. Inflate video track timescale (mdhd) by the multiplier (default 19x).
- *      Also inflate mdhd.duration by the same factor so real-time playback
- *      duration is preserved.
+ * HEADER PATCH MODE (recommended):
+ *   1. Patch mvhd timescale and duration by mult — the "lie" that tricks
+ *      TikTok's ingest parser into passthrough mode (non-standard timescale).
+ *   2. Patch tkhd/elst durations by mult to keep real-time playback correct.
+ *   3. Inflate mdhd timescale and duration by mult for consistent timescale.
+ *   4. Inflate sample tables following inflate_frames_mp4.py:
+ *      - stts sample_count × mult (delta unchanged)
+ *      - stsc samples_per_chunk × mult (first_chunk unchanged)
+ *      - stsz repeat each size × mult (or multiply count for uniform)
+ *      - stss remap keyframe indices K → (K-1)*mult+1 … K*mult
+ *      - stco/co64 unchanged (shifted separately for box reordering)
+ *   5. Inflate ctts sample_count × mult (if present).
+ *   6. Shift stco/co64 chunk offsets for box reordering [ftyp][mdat][moov].
+ *   7. Write encoder tag, handler name, optional TikTok 9:16 dimensions.
  *
- *   2. Inflate stts sample_count by the multiplier (declares N*mult frames
- *      instead of N).
+ * FRAME INFLATION MODE (original):
+ *   Duplicates stco/stsz entries to declare mult× more frames. FPS in ffprobe
+ *   shows mult× original. Requires all-I-frame input.
  *
- *   3. Inflate ctts sample_count by the multiplier (if present).
- *
- *   4. Inflate stsz (sample sizes) by repeating each entry mult times. This
- *      tells the decoder to read the same byte range mult times per original
- *      frame, producing mult duplicate frames per original frame.
- *
- *   5. Inflate stco/co64 (chunk offsets) by repeating each entry mult times.
- *      Combined with the unchanged stsc (run-length encoded: every chunk has
- *      the same sample count), this creates mult "fake chunks" per real chunk,
- *      each pointing to the same byte range and producing the same set of
- *      frames as the original.
- *
- *      Net effect: r_frame_rate = new_timescale / delta = mult * original_fps,
- *      while actual playback speed stays the same (each duplicate frame is
- *      shown for 1/mult of the original frame duration).
- *
- *   6. Drop stss (sync samples) so every sample is treated as a keyframe.
- *      This avoids the headache of mapping keyframe indices through the
- *      multiplier and is safe for TikTok upload (they re-encode anyway).
- *
- *   7. Add a ©too (encoding tool) atom under trak/udta/ilst with the encoder
- *      tag string.
- *
- *   8. Overwrite the handler_name in the video hdlr box.
- *
- *   9. Optionally overwrite tkhd width/height to force TikTok 9:16 display.
- *
- *  10. Move the moov box to AFTER mdat in the output (no +faststart). All
- *      chunk offsets in stco/co64 are shifted by the delta between the old and
- *      new mdat positions.
- *
- * The output is structured as: [ftyp] [mdat] [moov]
+ * @see src/lib/mp4/hazeEncoder.ts — inline comments reference the Python
+ *      implementation in inflate_frames_mp4.py for the sample table inflation.
  */
 
 import { Box, HazeOptions } from "./types";
@@ -128,9 +110,6 @@ export async function hazeEncode(
   if (options.mode === "header_patch") {
     return hazeHeaderPatch(data, options, onProgress);
   }
-  if (options.mode === "flame_inflation") {
-    return hazeFlameInflation(data, options, onProgress);
-  }
   return hazeFrameInflation(data, options, onProgress);
 }
 
@@ -145,25 +124,24 @@ export async function hazeEncode(
  * CRITICAL: We scale BOTH mvhd.timescale AND mvhd.duration by `mult`. This
  * keeps the movie duration correct (duration/timescale is unchanged) so the
  * video plays at full length. The "lie" is the non-standard timescale value
- * itself, NOT a duration mismatch. (A duration mismatch would make players
- * truncate the video — e.g., a 19s video showing as 1s.)
+ * itself, NOT a duration mismatch.
  *
- * Does NOT touch:
- *   - mdhd (media header) — media track stays internally consistent
- *   - stts, stsz, stco, stsc, stss — no sample table changes, no frame duplication
- *   - mdat (media data) — video bytes are completely untouched
- *
- * So there is ZERO corruption risk with ANY input — P-frames, B-frames, HEVC,
- * whatever. The video plays identically to the original.
+ * Sample table inflation follows inflate_frames_mp4.py — the stts/stsc/stsz
+ * boxes are inflated so each original chunk declares mult× more samples (all
+ * pointing to the same byte range), while stco/co64 chunk offsets remain
+ * unchanged. This produces mult duplicate frames per original frame without
+ * re-encoding. Combined with the mdhd timescale inflation, ffprobe reports
+ * mult× the original FPS.
  *
  * Changes:
  *   1. mvhd.timescale × mult AND mvhd.duration × mult → movie duration stays
  *      correct, but timescale is non-standard (the "lie").
- *   2. moov moved after mdat → faststart OFF.
- *   3. Encoder tag written to trak/udta/ilst.
- *   4. handler_name set in hdlr.
- *   5. tkhd width/height forced to 1080×1920 (TikTok 9:16) if enabled.
- *   6. stco/co64 offsets shifted to account for box reordering.
+ *   2. tkhd/elst durations × mult → track durations match new mvhd timescale.
+ *   3. mdhd.timescale × mult AND mdhd.duration × mult → consistent media timescale.
+ *   4. Sample tables inflated per inflate_frames_mp4.py (stts, stsc, stsz, stss).
+ *   5. ctts sample_count × mult (if present) for composition time consistency.
+ *   6. stco/co64 offsets shifted for box reordering [ftyp][mdat][moov].
+ *   7. Encoder tag, handler name, optional TikTok 9:16 dimensions.
  */
 async function hazeHeaderPatch(
   data: Uint8Array,
@@ -237,12 +215,30 @@ async function hazeHeaderPatch(
     }
   }
 
-  // NOTE: We deliberately do NOT touch mdhd, stts, stsz, stsc, or stss.
-  // The media track stays internally consistent so the video plays correctly.
-  // Only the movie container header (mvhd), track headers (tkhd), and edit
-  // lists (elst) are patched — all of which use mvhd.timescale units.
+  // Step 3.6: Inflate sample tables following inflate_frames_mp4.py.
+  // mdhd timescale/duration × mult for consistent media timescale.
+  // stts/stsc/stsz/stss inflated via inflateStblPythonStyle below.
+  // Chunk offsets are NOT duplicated (they are just shifted below).
+  onProgress?.("Inflating timescale & sample tables (frame inflation)", 42);
+  inflateMdhd(mdia, mult);
 
-  // Step 3.5: Shift stco/co64 chunk offsets to account for the box reordering.
+  const minf = findChild(mdia, "minf");
+  if (!minf) throw new Error("minf box not found in video track.");
+  const stbl = findChild(minf, "stbl");
+  if (!stbl) throw new Error("stbl box not found in video track.");
+
+  // Inflate sample tables following inflate_frames_mp4.py approach:
+  // stts sample_count × mult, stsc samples_per_chunk × mult,
+  // stsz repeat sizes × mult, stss remap keyframe indices.
+  // stco/co64 left unchanged (shifted separately below for box reordering).
+  inflateStblPythonStyle(stbl, mult, options.dropSyncSamples);
+
+  // Inflate ctts if present — not in the original Python script, but needed
+  // for composition time consistency when sample_count is multiplied.
+  const ctts = findChild(stbl, "ctts");
+  if (ctts) inflateCtts(ctts, mult);
+
+  // Step 3.7: Shift stco/co64 chunk offsets to account for the box reordering.
   // When we move mdat to position 2 (right after ftyp), its file offset changes.
   // The stco entries in the video track point to absolute file offsets within
   // mdat, so they must be shifted by the same delta to remain valid.
@@ -252,16 +248,10 @@ async function hazeHeaderPatch(
   const offsetDelta = newMdatOffset - oldMdatOffset;
 
   if (offsetDelta !== 0) {
-    const minf = findChild(mdia, "minf");
-    if (minf) {
-      const stbl = findChild(minf, "stbl");
-      if (stbl) {
-        const stco = findChild(stbl, "stco");
-        if (stco) shiftStco(stco, offsetDelta);
-        const co64 = findChild(stbl, "co64");
-        if (co64) shiftCo64(co64, offsetDelta);
-      }
-    }
+    const stco = findChild(stbl, "stco");
+    if (stco) shiftStco(stco, offsetDelta);
+    const co64 = findChild(stbl, "co64");
+    if (co64) shiftCo64(co64, offsetDelta);
   }
 
   // Step 4: Set encoder tag & handler name
@@ -1333,4 +1323,54 @@ function inflateStscFlame(stsc: Box, mult: number): void {
     );
   }
   stsc.payload = newPayload;
+}
+
+/**
+ * Inflate sample tables inside stbl following the approach from
+ * inflate_frames_mp4.py (Python frame inflation script).
+ *
+ * Ported from the update_stbl() function in inflate_frames_mp4.py.
+ * This multiplies the declared frame count without re-encoding by
+ * modifying the sample table entries so each original chunk declares
+ * mult× more samples, all pointing to the same byte range.
+ *
+ * Operations (matching the Python script exactly):
+ *   - stts: multiply each entry's sample_count by mult (sample_delta unchanged)
+ *   - stsc: multiply samples_per_chunk by mult (first_chunk unchanged)
+ *   - stsz: repeat each sample size entry mult times (or multiply count for
+ *           uniform/constant sample size)
+ *   - stss: remap keyframe indices — each keyframe K becomes mult entries
+ *           (K-1)*mult+1 through K*mult
+ *   - stco/co64: left unchanged (caller handles offset shifting for box
+ *                reordering separately)
+ *
+ * @param stbl - The Sample Table Box to inflate.
+ * @param mult - The frame multiplier (e.g. 19).
+ * @param dropSync - When true, drop stss/stps/sdtp instead of inflating stss.
+ */
+function inflateStblPythonStyle(
+  stbl: Box,
+  mult: number,
+  dropSync: boolean,
+): void {
+  // stts (Time-to-Sample Box): multiply sample_count by mult
+  const stts = findChild(stbl, "stts");
+  if (stts) inflateStts(stts, mult);
+
+  // stsc (Sample-to-Chunk Box): multiply samples_per_chunk by mult
+  const stsc = findChild(stbl, "stsc");
+  if (stsc) inflateStscFlame(stsc, mult);
+
+  // stsz (Sample Size Box): repeat each size entry mult times
+  const stsz = findChild(stbl, "stsz");
+  if (stsz) inflateStsz(stsz, mult);
+
+  // stss (Sync Sample Box) / stps / sdtp handling
+  if (dropSync) {
+    removeChildren(stbl, ["stss", "stps", "sdtp"]);
+  } else {
+    const stss = findChild(stbl, "stss");
+    if (stss) inflateStss(stss, mult);
+    removeChildren(stbl, ["sdtp"]);
+  }
 }
