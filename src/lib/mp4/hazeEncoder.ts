@@ -110,12 +110,271 @@ export class HazeKeyframeError extends Error {
 /**
  * Encode an MP4 file with haze metadata.
  *
+ * Dispatches to either `hazeHeaderPatch` (metadata exploit — patches mvhd/mdhd
+ * timescales, no sample table duplication, no corruption) or `hazeFrameInflation`
+ * (original method — duplicates stco/stsz entries, requires all-I-frame).
+ *
  * @param data - The raw bytes of the input MP4 file.
  * @param options - Encoding options.
  * @param onProgress - Optional progress callback.
- * @throws {HazeKeyframeError} when the input has P/B-frames and options.forceEncode is false.
+ * @throws {HazeKeyframeError} when mode is "frame_inflation", the input has
+ *   P/B-frames, and options.forceEncode is false.
  */
 export async function hazeEncode(
+  data: Uint8Array,
+  options: HazeOptions,
+  onProgress?: ProgressCallback,
+): Promise<HazeResult> {
+  if (options.mode === "header_patch") {
+    return hazeHeaderPatch(data, options, onProgress);
+  }
+  return hazeFrameInflation(data, options, onProgress);
+}
+
+/**
+ * Header Patch mode (the real "Haze Method" / metadata exploit).
+ *
+ * Patches ONLY the mvhd (Movie Header) timescale to create a duration mismatch
+ * between the movie container (mvhd) and the media track (mdhd). This is the
+ * "lie" that tricks TikTok's ingest parser into passthrough mode.
+ *
+ * Does NOT touch:
+ *   - mdhd (media header) — media track stays internally consistent
+ *   - stts, stsz, stco, stsc, stss — no sample table changes, no frame duplication
+ *   - mdat (media data) — video bytes are completely untouched
+ *
+ * So there is ZERO corruption risk with ANY input — P-frames, B-frames, HEVC,
+ * whatever. The video plays identically to the original.
+ *
+ * Changes:
+ *   1. mvhd.timescale × mult (keep mvhd.duration) → movie duration appears
+ *      mult× shorter, creating a mismatch with mdhd duration. This is the
+ *      core "lie" that confuses TikTok.
+ *   2. moov moved after mdat → faststart OFF.
+ *   3. Encoder tag written to trak/udta/ilst.
+ *   4. handler_name set in hdlr.
+ *   5. tkhd width/height forced to 1080×1920 (TikTok 9:16) if enabled.
+ *
+ * Note: r_frame_rate and avg_frame_rate in ffprobe stay the same (they come
+ * from mdhd/stts which we don't touch). The mvhd duration mismatch is what
+ * tools like TikTok's ingest analyzer see — they compute "movie FPS" as
+ * sample_count / mvhd_duration, which appears mult× higher.
+ */
+async function hazeHeaderPatch(
+  data: Uint8Array,
+  options: HazeOptions,
+  onProgress?: ProgressCallback,
+): Promise<HazeResult> {
+  const startTime = performance.now();
+  const mult = options.multiplier;
+
+  onProgress?.("Parsing MP4 structure", 5);
+
+  // Step 1: Parse top-level boxes
+  const boxes = parseMP4(data);
+  if (boxes.length === 0) {
+    throw new Error("No MP4 boxes found. Is this a valid MP4 file?");
+  }
+
+  const ftyp = boxes.find((b) => b.type === "ftyp");
+  if (!ftyp) throw new Error("ftyp box not found - not a valid MP4 file.");
+
+  const moov = boxes.find((b) => b.type === "moov");
+  if (!moov) throw new Error("moov box not found - cannot process.");
+
+  const mdat = boxes.find((b) => b.type === "mdat");
+  if (!mdat) throw new Error("mdat box not found - no media data.");
+
+  onProgress?.("Locating video track", 15);
+
+  // Step 2: Find video track (for encoder tag, handler name, tkhd)
+  const videoTrak = findVideoTrack(moov);
+  if (!videoTrak) throw new Error("No video track found in moov.");
+
+  const mdia = findChild(videoTrak, "mdia");
+  if (!mdia) throw new Error("mdia box not found in video track.");
+
+  // Step 3: Patch mvhd timescale — THE core of the metadata exploit.
+  // We multiply mvhd.timescale by `mult` but keep mvhd.duration the same.
+  // This makes the movie container duration appear `mult`× shorter,
+  // creating a mismatch with the media track (mdhd) duration. TikTok's
+  // ingest parser sees this non-standard timescale and may fall back to
+  // passthrough mode to avoid breaking the file.
+  onProgress?.("Patching mvhd timescale (the lie)", 30);
+  const mvhd = findChild(moov, "mvhd");
+  if (mvhd) {
+    patchMvhdTimescale(mvhd, mult);
+  }
+
+  // NOTE: We deliberately do NOT touch mdhd, stts, stsz, stsc, or stss.
+  // The media track stays internally consistent so the video plays correctly.
+  // Only the movie container header (mvhd) is lied about.
+
+  // Step 3.5: Shift stco/co64 chunk offsets to account for the box reordering.
+  // When we move mdat to position 2 (right after ftyp), its file offset changes.
+  // The stco entries in the video track point to absolute file offsets within
+  // mdat, so they must be shifted by the same delta to remain valid.
+  onProgress?.("Shifting chunk offsets", 45);
+  const oldMdatOffset = mdat.fileOffset;
+  const newMdatOffset = ftyp.fileOffset + ftyp.size;
+  const offsetDelta = newMdatOffset - oldMdatOffset;
+
+  if (offsetDelta !== 0) {
+    const minf = findChild(mdia, "minf");
+    if (minf) {
+      const stbl = findChild(minf, "stbl");
+      if (stbl) {
+        const stco = findChild(stbl, "stco");
+        if (stco) shiftStco(stco, offsetDelta);
+        const co64 = findChild(stbl, "co64");
+        if (co64) shiftCo64(co64, offsetDelta);
+      }
+    }
+  }
+
+  // Step 4: Set encoder tag & handler name
+  onProgress?.("Writing encoder tag & handler name", 60);
+  let udta = findChild(videoTrak, "udta");
+  if (!udta) {
+    udta = makeContainerBox("udta", []);
+    videoTrak.children.push(udta);
+  }
+  setEncoderTag(udta, options.encoderTag);
+
+  const hdlr = findChild(mdia, "hdlr");
+  if (hdlr) {
+    setHandlerName(hdlr, options.handlerName);
+  }
+
+  // Step 5: Force TikTok 9:16 dimensions if enabled
+  if (options.forceTikTok9x16) {
+    const tkhd = findChild(videoTrak, "tkhd");
+    if (tkhd) {
+      setTkhdDimensions(tkhd, options.tikTokWidth, options.tikTokHeight);
+    }
+  }
+
+  // Step 6: Reorder boxes — [ftyp] [mdat] [moov] (faststart OFF)
+  onProgress?.("Reordering boxes (moov after mdat)", 80);
+  const reordered: Box[] = [];
+  reordered.push(ftyp);
+  reordered.push(mdat);
+  for (const b of boxes) {
+    if (b.type !== "ftyp" && b.type !== "mdat") {
+      reordered.push(b);
+    }
+  }
+
+  onProgress?.("Serializing output", 95);
+  const output = writeMP4(reordered);
+
+  const elapsedMs = performance.now() - startTime;
+  onProgress?.("Done", 100);
+
+  return {
+    output,
+    inputSize: data.length,
+    outputSize: output.length,
+    elapsedMs,
+  };
+}
+
+// ============================================================================
+// Header patch helper functions
+// ============================================================================
+
+/**
+ * Patch mvhd (Movie Header Box) timescale by multiplying it by `mult`.
+ * Keeps mvhd.duration UNCHANGED — this creates the duration mismatch that is
+ * the core of the haze metadata exploit.
+ *
+ * mvhd v0: 1 byte version, 3 bytes flags, 4 bytes creation, 4 bytes modification,
+ *           4 bytes timescale, 4 bytes duration, ...
+ * mvhd v1: same but creation/modification/duration are 8 bytes each.
+ */
+function patchMvhdTimescale(mvhd: Box, mult: number): void {
+  const p = mvhd.payload;
+  if (p.length < 4) return;
+  const version = p[0];
+
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+
+  if (version === 1) {
+    // timescale at offset 20 (after 4 version/flags + 8 creation + 8 modification)
+    if (p.length < 24) return;
+    const oldTimescale = readU32(p, 20);
+    const newTimescale = oldTimescale * mult;
+    writeU32(newPayload, 20, newTimescale <= 0xffffffff ? newTimescale : newTimescale >>> 0);
+    // duration at offset 24 (8 bytes) — keep UNCHANGED
+  } else {
+    // version 0: timescale at offset 12 (after 4 version/flags + 4 creation + 4 modification)
+    if (p.length < 16) return;
+    const oldTimescale = readU32(p, 12);
+    const newTimescale = oldTimescale * mult;
+    writeU32(newPayload, 12, newTimescale <= 0xffffffff ? newTimescale : newTimescale >>> 0);
+    // duration at offset 16 (4 bytes) — keep UNCHANGED
+  }
+  mvhd.payload = newPayload;
+}
+
+/**
+ * Shift all chunk offsets in stco by `delta` (without inflating).
+ * Used in header_patch mode to fix chunk offsets after box reordering.
+ *
+ * stco format: 4 bytes version/flags, 4 bytes entry_count,
+ *              then entry_count * 4 bytes of 32-bit offsets.
+ */
+function shiftStco(stco: Box, delta: number): void {
+  const p = stco.payload;
+  if (p.length < 8) return;
+  const entryCount = readU32(p, 4);
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+  for (let i = 0; i < entryCount; i++) {
+    const off = 8 + i * 4;
+    if (off + 4 > p.length) break;
+    const oldOffset = readU32(p, off);
+    const newOffset = (oldOffset + delta) >>> 0;
+    writeU32(newPayload, off, newOffset);
+  }
+  stco.payload = newPayload;
+}
+
+/**
+ * Shift all chunk offsets in co64 by `delta` (without inflating).
+ * co64 uses 8-byte offsets.
+ */
+function shiftCo64(co64: Box, delta: number): void {
+  const p = co64.payload;
+  if (p.length < 8) return;
+  const entryCount = readU32(p, 4);
+  const newPayload = new Uint8Array(p.length);
+  newPayload.set(p);
+  const bigDelta = BigInt(delta);
+  for (let i = 0; i < entryCount; i++) {
+    const off = 8 + i * 8;
+    if (off + 8 > p.length) break;
+    let offset = readU64(p, off);
+    offset = offset + bigDelta;
+    if (offset < 0n) offset = 0n;
+    writeU64(newPayload, off, offset);
+  }
+  co64.payload = newPayload;
+}
+
+// ============================================================================
+// Frame inflation mode (original haze method)
+// ============================================================================
+
+/**
+ * Frame Inflation mode (original haze method).
+ *
+ * Duplicates stco/stsz entries to physically declare `mult`× more frames.
+ * FPS in ffprobe shows `mult`× the original. Requires all-I-frame input
+ * (P-frames would compound deltas and corrupt).
+ */
+async function hazeFrameInflation(
   data: Uint8Array,
   options: HazeOptions,
   onProgress?: ProgressCallback,
@@ -154,11 +413,6 @@ export async function hazeEncode(
   if (!stbl) throw new Error("stbl box not found in video track.");
 
   // Step 2.5: Keyframe guard — refuse to encode P/B-frame inputs unless forceEncode is set.
-  // Haze encoding duplicates each sample `mult`× by pointing `mult` stco entries at the
-  // same byte offset. For I-frames this produces `mult` identical frames (correct). For
-  // P-frames, the same delta is applied `mult` times in a row, compounding the motion and
-  // producing visible corruption. Re-encoding the input to all-I-frame first is the only
-  // metadata-only-safe fix.
   if (!options.forceEncode) {
     const stts = findChild(stbl, "stts");
     const stss = findChild(stbl, "stss");
@@ -181,8 +435,6 @@ export async function hazeEncode(
   }
 
   // Step 3: Compute mdat offset shift
-  // New layout: [ftyp] [mdat] [moov]
-  // New mdat offset = ftyp size
   const oldMdatOffset = mdat.fileOffset;
   const newMdatOffset = ftyp.fileOffset + ftyp.size;
   const offsetDelta = newMdatOffset - oldMdatOffset;

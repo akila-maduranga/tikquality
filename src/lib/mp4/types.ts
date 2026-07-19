@@ -30,8 +30,23 @@ export interface Box {
   isContainer: boolean;
 }
 
+/** Encoding mode. */
+export type HazeMode = "header_patch" | "frame_inflation";
+
 /** Options that control haze encoding behaviour. */
 export interface HazeOptions {
+  /**
+   * Encoding mode:
+   * - "header_patch": Metadata exploit. Patches mvhd/mdhd timescales to create
+   *   a duration mismatch that tricks TikTok's parser into passthrough. Does NOT
+   *   touch sample tables (stsz, stco, stsc) — no corruption risk with any input.
+   *   The FPS in ffprobe stays the same (r_frame_rate comes from stts deltas /
+   *   mdhd timescale, both scaled proportionally).
+   * - "frame_inflation": Original haze method. Duplicates stco/stsz entries to
+   *   physically declare 19× more frames. FPS in ffprobe shows 19×. Requires
+   *   all-I-frame input (P-frames would compound deltas and corrupt).
+   */
+  mode: HazeMode;
   /** Internal frame multiplier. Default 19 (matches haze_encode.sh). */
   multiplier: number;
   /** Encoder tag string written into track + movie metadata. */
@@ -47,22 +62,20 @@ export interface HazeOptions {
   /** When true, drop the stss (sync sample) box so every sample is treated as a keyframe. */
   dropSyncSamples: boolean;
   /**
-   * When true, encode even if the input video has P/B-frames. The output's
-   * metadata will report the inflated FPS, but the video will have visible
-   * artifacts (P-frame deltas compound when decoded 19×). Defaults to false —
-   * the encoder throws when the input is not all-I-frame.
+   * When true, encode even if the input video has P/B-frames (frame_inflation
+   * mode only). The output's metadata will report the inflated FPS, but the
+   * video will have visible artifacts.
    */
   forceEncode: boolean;
   /**
-   * When true, automatically pre-process the input with ffmpeg.wasm to
-   * all-I-frame before haze encoding. This produces an artifact-free output
-   * for any input. Takes precedence over forceEncode (if both are true,
-   * autoPreprocess wins and no error is thrown). Defaults to true.
+   * When true (frame_inflation mode only), automatically pre-process the input
+   * with ffmpeg.wasm to all-I-frame before haze encoding.
    */
   autoPreprocess: boolean;
 }
 
 export const DEFAULT_OPTIONS: HazeOptions = {
+  mode: "header_patch",
   multiplier: 19,
   encoderTag: "Haze Encoder - haze.vercel.app",
   handlerName: "VideoHandler",

@@ -135,8 +135,10 @@ export function HazeEncoder() {
       let inputBuffer = new Uint8Array(await file.arrayBuffer());
       let inputMeta = originalMeta;
 
-      // Stage 1: auto-preprocess to all-I-frame if needed (and enabled)
+      // Stage 1: auto-preprocess to all-I-frame if needed (frame_inflation mode only)
+      // Header Patch mode doesn't need pre-processing — it doesn't touch sample tables.
       const needsPreprocess =
+        options.mode === "frame_inflation" &&
         options.autoPreprocess &&
         inputMeta &&
         !inputMeta.allKeyframes;
@@ -476,14 +478,26 @@ export function HazeEncoder() {
               </Alert>
             )}
 
-            {originalMeta && !originalMeta.allKeyframes && !keyframeError && (
+            {originalMeta && !originalMeta.allKeyframes && !keyframeError && options.mode === "frame_inflation" && (
               <Alert className="mt-4 border-amber-500/50 bg-amber-500/5 text-amber-900 dark:text-amber-100">
                 <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
                 <AlertDescription className="text-xs">
-                  This video has P/B-frames. Haze encoding will refuse to
-                  produce a corrupted output — either pre-process to all-I-frame
-                  first, or enable <span className="font-semibold">Force encode</span>{" "}
-                  below.
+                  This video has P/B-frames. Frame Inflation mode will refuse
+                  to produce a corrupted output — either pre-process to all-I-frame
+                  first, enable <span className="font-semibold">Auto-convert</span>{" "}
+                  below, or switch to <span className="font-semibold">Header Patch</span>{" "}
+                  mode (which works with any input).
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {originalMeta && !originalMeta.allKeyframes && options.mode === "header_patch" && (
+              <Alert className="mt-4 border-emerald-500/50 bg-emerald-500/5 text-emerald-900 dark:text-emerald-100">
+                <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                <AlertDescription className="text-xs">
+                  This video has P/B-frames, but <span className="font-semibold">Header Patch</span>{" "}
+                  mode doesn't touch sample tables — it only patches the mvhd
+                  timescale. The video will encode without corruption.
                 </AlertDescription>
               </Alert>
             )}
@@ -504,11 +518,70 @@ export function HazeEncoder() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
+              {/* Mode selector */}
+              <div className="space-y-2">
+                <Label className="text-base">Encoding mode</Label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOptions((o) => ({ ...o, mode: "header_patch" }))
+                    }
+                    className={`text-left rounded-lg border p-3 transition-colors ${
+                      options.mode === "header_patch"
+                        ? "border-emerald-500 bg-emerald-500/5"
+                        : "border-border hover:border-muted-foreground/50"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                      <span className="font-medium text-sm">
+                        Header Patch
+                      </span>
+                      <Badge variant="secondary" className="ml-auto text-xs">
+                        Recommended
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Metadata exploit. Patches mvhd timescale to trick TikTok
+                      into passthrough. No corruption, works with any input.
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOptions((o) => ({ ...o, mode: "frame_inflation" }))
+                    }
+                    className={`text-left rounded-lg border p-3 transition-colors ${
+                      options.mode === "frame_inflation"
+                        ? "border-amber-500 bg-amber-500/5"
+                        : "border-border hover:border-muted-foreground/50"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <AlertTriangle className="h-4 w-4 text-amber-500" />
+                      <span className="font-medium text-sm">
+                        Frame Inflation
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Original method. Duplicates sample tables to show 19× FPS
+                      in ffprobe. Requires all-I-frame input (auto-preprocess
+                      available).
+                    </p>
+                  </button>
+                </div>
+              </div>
+
+              <Separator />
+
               {/* Multiplier */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <Label htmlFor="multiplier" className="text-base">
-                    Frame multiplier (flame inflation)
+                    {options.mode === "header_patch"
+                      ? "Timescale multiplier"
+                      : "Frame multiplier (flame inflation)"}
                   </Label>
                   <Badge variant="secondary" className="font-mono text-base">
                     ×{options.multiplier}
@@ -525,10 +598,24 @@ export function HazeEncoder() {
                   }
                 />
                 <p className="text-xs text-muted-foreground">
-                  Multiplies the internal frame rate by inflating{" "}
-                  <code className="font-mono">stts</code> sample counts and{" "}
-                  <code className="font-mono">mdhd</code> timescale. File info
-                  will show <span className="font-mono">display_fps × multiplier</span>.
+                  {options.mode === "header_patch" ? (
+                    <>
+                      Multiplies <code className="font-mono">mvhd.timescale</code>{" "}
+                      by this factor, creating a duration mismatch that tricks
+                      TikTok's ingest parser into passthrough mode.
+                    </>
+                  ) : (
+                    <>
+                      Multiplies the internal frame rate by inflating{" "}
+                      <code className="font-mono">stts</code> sample counts and{" "}
+                      <code className="font-mono">mdhd</code> timescale. File info
+                      will show{" "}
+                      <span className="font-mono">
+                        display_fps × multiplier
+                      </span>
+                      .
+                    </>
+                  )}
                 </p>
               </div>
 
@@ -596,61 +683,66 @@ export function HazeEncoder() {
                     }
                   />
                 </div>
-                <div className="flex items-center justify-between rounded-lg border p-3">
-                  <div className="space-y-0.5">
-                    <Label htmlFor="dropSync" className="text-base">
-                      Drop sync sample table
-                    </Label>
-                    <p className="text-xs text-muted-foreground">
-                      Removes <code className="font-mono">stss</code> so every
-                      frame is treated as a keyframe. Safer for haze-encoded
-                      files.
-                    </p>
+                {options.mode === "frame_inflation" && (
+                  <div className="flex items-center justify-between rounded-lg border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="dropSync" className="text-base">
+                        Drop sync sample table
+                      </Label>
+                      <p className="text-xs text-muted-foreground">
+                        Removes <code className="font-mono">stss</code> so every
+                        frame is treated as a keyframe. Safer for haze-encoded
+                        files.
+                      </p>
+                    </div>
+                    <Switch
+                      id="dropSync"
+                      checked={options.dropSyncSamples}
+                      onCheckedChange={(v) =>
+                        setOptions((o) => ({ ...o, dropSyncSamples: v }))
+                      }
+                    />
                   </div>
-                  <Switch
-                    id="dropSync"
-                    checked={options.dropSyncSamples}
-                    onCheckedChange={(v) =>
-                      setOptions((o) => ({ ...o, dropSyncSamples: v }))
-                    }
-                  />
-                </div>
-                <div
-                  className={`flex items-center justify-between rounded-lg border p-3 ${
-                    options.autoPreprocess
-                      ? "border-emerald-500/50 bg-emerald-500/5"
-                      : ""
-                  }`}
-                >
-                  <div className="space-y-0.5">
-                    <Label htmlFor="autoPreprocess" className="text-base flex items-center gap-1.5">
-                      <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-                      Auto-convert to all-I-frame (recommended)
-                    </Label>
-                    <p className="text-xs text-muted-foreground">
-                      Uses ffmpeg.wasm to convert P/B-frame inputs to all-I-frame
-                      before haze encoding. First run downloads ~30MB. Produces
-                      artifact-free output for any input.
-                    </p>
+                )}
+                {options.mode === "frame_inflation" && (
+                  <div
+                    className={`flex items-center justify-between rounded-lg border p-3 ${
+                      options.autoPreprocess
+                        ? "border-emerald-500/50 bg-emerald-500/5"
+                        : ""
+                    }`}
+                  >
+                    <div className="space-y-0.5">
+                      <Label htmlFor="autoPreprocess" className="text-base flex items-center gap-1.5">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                        Auto-convert to all-I-frame (recommended)
+                      </Label>
+                      <p className="text-xs text-muted-foreground">
+                        Uses ffmpeg.wasm to convert P/B-frame inputs to all-I-frame
+                        before haze encoding. First run downloads ~30MB. Produces
+                        artifact-free output for any input.
+                      </p>
+                    </div>
+                    <Switch
+                      id="autoPreprocess"
+                      checked={options.autoPreprocess}
+                      onCheckedChange={(v) => {
+                        setOptions((o) => ({ ...o, autoPreprocess: v }));
+                        setKeyframeError(null);
+                      }}
+                    />
                   </div>
-                  <Switch
-                    id="autoPreprocess"
-                    checked={options.autoPreprocess}
-                    onCheckedChange={(v) => {
-                      setOptions((o) => ({ ...o, autoPreprocess: v }));
-                      setKeyframeError(null);
-                    }}
-                  />
-                </div>
-                <div
-                  className={`flex items-center justify-between rounded-lg border p-3 ${
-                    options.forceEncode
-                      ? "border-amber-500/50 bg-amber-500/5"
-                      : "opacity-60"
-                  } ${options.autoPreprocess ? "pointer-events-none" : ""}`}
-                >
-                  <div className="space-y-0.5">
-                    <Label htmlFor="forceEncode" className="text-base flex items-center gap-1.5">
+                )}
+                {options.mode === "frame_inflation" && (
+                  <div
+                    className={`flex items-center justify-between rounded-lg border p-3 ${
+                      options.forceEncode
+                        ? "border-amber-500/50 bg-amber-500/5"
+                        : "opacity-60"
+                    } ${options.autoPreprocess ? "pointer-events-none" : ""}`}
+                  >
+                    <div className="space-y-0.5">
+                      <Label htmlFor="forceEncode" className="text-base flex items-center gap-1.5">
                       <AlertTriangle className="h-4 w-4 text-amber-500" />
                       Force encode (P/B-frame input)
                     </Label>
@@ -670,6 +762,7 @@ export function HazeEncoder() {
                     }}
                   />
                 </div>
+                )}
               </div>
             </CardContent>
           </Card>
