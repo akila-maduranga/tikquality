@@ -46,6 +46,13 @@ export interface HazeOptions {
   tikTokHeight: number;
   /** When true, drop the stss (sync sample) box so every sample is treated as a keyframe. */
   dropSyncSamples: boolean;
+  /**
+   * When true, encode even if the input video has P/B-frames. The output's
+   * metadata will report the inflated FPS, but the video will have visible
+   * artifacts (P-frame deltas compound when decoded 19×). Defaults to false —
+   * the encoder throws when the input is not all-I-frame.
+   */
+  forceEncode: boolean;
 }
 
 export const DEFAULT_OPTIONS: HazeOptions = {
@@ -56,6 +63,7 @@ export const DEFAULT_OPTIONS: HazeOptions = {
   tikTokWidth: 1080,
   tikTokHeight: 1920,
   dropSyncSamples: true,
+  forceEncode: false,
 };
 
 /** Snapshot of the metadata we report to the UI before/after encoding. */
@@ -72,6 +80,14 @@ export interface VideoMetadata {
   timescale: number;
   /** Total declared samples in stts. */
   sampleCount: number;
+  /** Number of keyframes (sync samples) declared in stss. If stss is absent, every sample is a keyframe (per ISO/IEC 14496-12). */
+  keyframeCount: number;
+  /** True when every sample is a keyframe (stss absent, or stss entry count == sample count). */
+  allKeyframes: boolean;
+  /** True when the codec is HEVC (hvc1/hev1) — affects NAL unit framing. */
+  isHevc: boolean;
+  /** Codec fourcc from stsd (e.g. "avc1", "hvc1", "hev1", "mp4v"). */
+  codec: string;
   /** Encoder tag from udta/ilst (©too or encoder field). */
   encoderTag: string | null;
   /** handler_name from hdlr. */

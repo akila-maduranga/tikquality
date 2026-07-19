@@ -30,13 +30,18 @@ import {
   Info,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Film,
   Clock,
   Gauge,
   Monitor,
+  Key,
+  Terminal,
+  Copy,
 } from "lucide-react";
 import {
   DEFAULT_OPTIONS,
+  HazeKeyframeError,
   HazeOptions,
   VideoMetadata,
   formatBytes,
@@ -65,13 +70,16 @@ export function HazeEncoder() {
   const [outputBlob, setOutputBlob] = useState<Blob | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [keyframeError, setKeyframeError] = useState<HazeKeyframeError | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [copied, setCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(async (file: File) => {
     setFile(file);
     setError(null);
+    setKeyframeError(null);
     setOutputBlob(null);
     setOutputUrl(null);
     setEncodedMeta(null);
@@ -105,6 +113,7 @@ export function HazeEncoder() {
     if (!file) return;
     setIsProcessing(true);
     setError(null);
+    setKeyframeError(null);
     setProgress({ stage: "Starting...", percent: 0 });
     setOutputBlob(null);
     setOutputUrl(null);
@@ -126,11 +135,24 @@ export function HazeEncoder() {
       const newMeta = readMetadata(newBoxes, result.output.length);
       setEncodedMeta(newMeta);
     } catch (e) {
-      setError(`Encoding failed: ${(e as Error).message}`);
+      if (e instanceof HazeKeyframeError) {
+        setKeyframeError(e);
+      } else {
+        setError(`Encoding failed: ${(e as Error).message}`);
+      }
     } finally {
       setIsProcessing(false);
     }
   }, [file, options]);
+
+  const copyFfmpegCommand = useCallback(() => {
+    const cmd =
+      "ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4";
+    navigator.clipboard?.writeText(cmd).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, []);
 
   const handleDownload = useCallback(() => {
     if (!outputBlob || !file) return;
@@ -257,9 +279,32 @@ export function HazeEncoder() {
                           {originalMeta.fps.toFixed(2)} fps
                           {" · "}
                           {formatDuration(originalMeta.duration)}
+                          {" · "}
+                          {originalMeta.codec || "mp4v"}
                         </>
                       )}
                     </p>
+                    {originalMeta && (
+                      <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5">
+                        {originalMeta.allKeyframes ? (
+                          <Badge
+                            variant="outline"
+                            className="gap-1 border-emerald-500/50 text-emerald-700 dark:text-emerald-400"
+                          >
+                            <CheckCircle2 className="h-3 w-3" />
+                            All I-frames · haze-ready
+                          </Badge>
+                        ) : (
+                          <Badge
+                            variant="outline"
+                            className="gap-1 border-amber-500/50 text-amber-700 dark:text-amber-400"
+                          >
+                            <AlertTriangle className="h-3 w-3" />
+                            {originalMeta.keyframeCount}/{originalMeta.sampleCount} keyframes · P/B-frames present
+                          </Badge>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <Button
                     variant="ghost"
@@ -292,6 +337,76 @@ export function HazeEncoder() {
                 <AlertCircle className="h-4 w-4" />
                 <AlertTitle>Error</AlertTitle>
                 <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+
+            {keyframeError && (
+              <Alert className="mt-4 border-amber-500/50 bg-amber-500/5 text-amber-900 dark:text-amber-100">
+                <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                <AlertTitle className="text-amber-900 dark:text-amber-100">
+                  Input has P/B-frames — output would be corrupted
+                </AlertTitle>
+                <AlertDescription className="space-y-3 text-amber-900 dark:text-amber-100">
+                  <p>
+                    Your video has{" "}
+                    <span className="font-mono font-semibold">
+                      {keyframeError.keyframeCount}
+                    </span>{" "}
+                    keyframes out of{" "}
+                    <span className="font-mono font-semibold">
+                      {keyframeError.sampleCount}
+                    </span>{" "}
+                    samples. Haze encoding duplicates each sample 19× by pointing
+                    multiple <code className="font-mono">stco</code> entries at
+                    the same byte offset. For I-frames this produces 19 identical
+                    frames (correct). For P-frames, the same motion delta is
+                    applied 19 times in a row, compounding the motion and
+                    producing visible corruption.
+                  </p>
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
+                    <p className="text-xs font-medium mb-1.5 flex items-center gap-1.5">
+                      <Terminal className="h-3 w-3" />
+                      Pre-process your video to all-I-frame first:
+                    </p>
+                    <code className="block font-mono text-xs break-all">
+                      ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4
+                    </code>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="mt-2 h-7 text-xs"
+                      onClick={copyFfmpegCommand}
+                    >
+                      {copied ? (
+                        <>
+                          <CheckCircle2 className="h-3 w-3 mr-1" /> Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3 mr-1" /> Copy command
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  <p className="text-xs">
+                    Or enable{" "}
+                    <span className="font-semibold">Force encode</span> below to
+                    encode anyway — the metadata will report 19× FPS, but the
+                    video will have visible artifacts.
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {originalMeta && !originalMeta.allKeyframes && !keyframeError && (
+              <Alert className="mt-4 border-amber-500/50 bg-amber-500/5 text-amber-900 dark:text-amber-100">
+                <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                <AlertDescription className="text-xs">
+                  This video has P/B-frames. Haze encoding will refuse to
+                  produce a corrupted output — either pre-process to all-I-frame
+                  first, or enable <span className="font-semibold">Force encode</span>{" "}
+                  below.
+                </AlertDescription>
               </Alert>
             )}
           </CardContent>
@@ -422,6 +537,33 @@ export function HazeEncoder() {
                     }
                   />
                 </div>
+                <div
+                  className={`flex items-center justify-between rounded-lg border p-3 ${
+                    options.forceEncode
+                      ? "border-amber-500/50 bg-amber-500/5"
+                      : ""
+                  }`}
+                >
+                  <div className="space-y-0.5">
+                    <Label htmlFor="forceEncode" className="text-base flex items-center gap-1.5">
+                      <AlertTriangle className="h-4 w-4 text-amber-500" />
+                      Force encode (P/B-frame input)
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Encode even when the input has P/B-frames. The metadata
+                      will report 19× FPS, but the video will have visible
+                      artifacts from compounding P-frame deltas.
+                    </p>
+                  </div>
+                  <Switch
+                    id="forceEncode"
+                    checked={options.forceEncode}
+                    onCheckedChange={(v) => {
+                      setOptions((o) => ({ ...o, forceEncode: v }));
+                      setKeyframeError(null);
+                    }}
+                  />
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -463,6 +605,25 @@ export function HazeEncoder() {
                       <span className="text-muted-foreground">Input</span>
                       <span className="font-mono">
                         {formatBytes(originalMeta.fileSize)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Codec</span>
+                      <span className="font-mono">
+                        {originalMeta.codec || "mp4v"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Keyframes</span>
+                      <span
+                        className={`font-mono ${
+                          originalMeta.allKeyframes
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : "text-amber-600 dark:text-amber-400"
+                        }`}
+                      >
+                        {originalMeta.keyframeCount}/{originalMeta.sampleCount}
+                        {originalMeta.allKeyframes ? " ✓" : " ⚠"}
                       </span>
                     </div>
                     <div className="flex justify-between">
@@ -618,6 +779,22 @@ export function HazeEncoder() {
                 overwritten to 1080×1920 (TikTok 9:16).
               </li>
             </ul>
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 my-3">
+              <p className="text-sm font-semibold text-amber-900 dark:text-amber-100 mb-1 flex items-center gap-1.5">
+                <AlertTriangle className="h-4 w-4" />
+                Important: input must be all-I-frame
+              </p>
+              <p className="text-xs text-amber-900 dark:text-amber-100">
+                Because haze encoding duplicates samples by pointing multiple
+                <code className="font-mono mx-1">stco</code>
+                entries at the same byte offset, P-frames would have their motion
+                delta compounded 19× (producing visible corruption). Pre-process
+                your video to all-I-frame first:
+              </p>
+              <code className="block font-mono text-xs mt-2 break-all text-amber-900 dark:text-amber-100">
+                ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4
+              </code>
+            </div>
             <p className="text-xs">
               Note: TikTok does not publish its recompression/skip logic and
               changes it over time. Haze encoding reproduces the measurable
@@ -680,6 +857,16 @@ function MetadataCompare({
       before: before.sampleCount.toLocaleString(),
       after: after.sampleCount.toLocaleString(),
       highlight: true,
+    },
+    {
+      label: "Keyframes (stss)",
+      before: `${before.keyframeCount.toLocaleString()}${before.allKeyframes ? " (all I-frames)" : ""}`,
+      after: `${after.keyframeCount.toLocaleString()}${after.allKeyframes ? " (all I-frames)" : ""}`,
+    },
+    {
+      label: "Codec",
+      before: before.codec || "—",
+      after: after.codec || "—",
     },
     {
       label: "Media timescale (mdhd)",

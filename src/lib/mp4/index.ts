@@ -6,5 +6,5 @@ export * from "./types";
 export * from "./parser";
 export * from "./writer";
 export * from "./metadata";
-export { hazeEncode } from "./hazeEncoder";
+export { hazeEncode, HazeKeyframeError } from "./hazeEncoder";
 export type { HazeResult, ProgressCallback } from "./hazeEncoder";

@@ -78,11 +78,42 @@ export interface HazeResult {
 }
 
 /**
+ * Error thrown when the input video has P/B-frames and haze encoding would
+ * produce a corrupted output. The user should either:
+ *   1. Re-encode the input to all-I-frame first (e.g. with
+ *      `ffmpeg -i in.mp4 -g 1 -bf 0 -c:v libx264 out.mp4`), OR
+ *   2. Set HazeOptions.forceEncode = true to encode anyway (the metadata will
+ *      report the inflated FPS, but the video will have visible artifacts).
+ */
+export class HazeKeyframeError extends Error {
+  /** Total sample count from stts. */
+  sampleCount: number;
+  /** Keyframe count from stss (or sampleCount if stss is absent). */
+  keyframeCount: number;
+  /** The ffmpeg command the user can run to pre-process the input. */
+  suggestedCommand: string;
+
+  constructor(sampleCount: number, keyframeCount: number) {
+    super(
+      `Input video has P/B-frames (${keyframeCount} keyframes out of ${sampleCount} samples). ` +
+        `Haze encoding duplicates each sample ${"mult"}× — for P-frames, the delta compounds on each duplicate decode, producing visible corruption. ` +
+        `Re-encode the input to all-I-frame first: ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4`,
+    );
+    this.name = "HazeKeyframeError";
+    this.sampleCount = sampleCount;
+    this.keyframeCount = keyframeCount;
+    this.suggestedCommand =
+      "ffmpeg -i input.mp4 -g 1 -bf 0 -c:v libx264 -preset fast -crf 18 all_iframes.mp4";
+  }
+}
+
+/**
  * Encode an MP4 file with haze metadata.
  *
  * @param data - The raw bytes of the input MP4 file.
  * @param options - Encoding options.
  * @param onProgress - Optional progress callback.
+ * @throws {HazeKeyframeError} when the input has P/B-frames and options.forceEncode is false.
  */
 export async function hazeEncode(
   data: Uint8Array,
@@ -121,6 +152,33 @@ export async function hazeEncode(
   if (!minf) throw new Error("minf box not found in video track.");
   const stbl = findChild(minf, "stbl");
   if (!stbl) throw new Error("stbl box not found in video track.");
+
+  // Step 2.5: Keyframe guard — refuse to encode P/B-frame inputs unless forceEncode is set.
+  // Haze encoding duplicates each sample `mult`× by pointing `mult` stco entries at the
+  // same byte offset. For I-frames this produces `mult` identical frames (correct). For
+  // P-frames, the same delta is applied `mult` times in a row, compounding the motion and
+  // producing visible corruption. Re-encoding the input to all-I-frame first is the only
+  // metadata-only-safe fix.
+  if (!options.forceEncode) {
+    const stts = findChild(stbl, "stts");
+    const stss = findChild(stbl, "stss");
+    if (stts) {
+      const sttsPayload = stts.payload;
+      if (sttsPayload.length >= 8) {
+        const entryCount = readU32(sttsPayload, 4);
+        let sampleCount = 0;
+        for (let i = 0; i < entryCount; i++) {
+          const off = 8 + i * 8;
+          if (off + 8 > sttsPayload.length) break;
+          sampleCount += readU32(sttsPayload, off);
+        }
+        const keyframeCount = stss ? readU32(stss.payload, 4) : sampleCount;
+        if (keyframeCount < sampleCount) {
+          throw new HazeKeyframeError(sampleCount, keyframeCount);
+        }
+      }
+    }
+  }
 
   // Step 3: Compute mdat offset shift
   // New layout: [ftyp] [mdat] [moov]

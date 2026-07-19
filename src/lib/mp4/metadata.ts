@@ -173,6 +173,8 @@ export function readMetadata(boxes: Box[], fileSize: number): VideoMetadata | nu
   const minf = findChild(mdia, "minf");
   const stbl = minf ? findChild(minf, "stbl") : null;
   const stts = stbl ? findChild(stbl, "stts") : null;
+  const stss = stbl ? findChild(stbl, "stss") : null;
+  const stsd = stbl ? findChild(stbl, "stsd") : null;
 
   const { timescale, duration: mdhdDuration } = parseMdhd(mdhd);
   const { width, height } = parseTkhd(tkhd);
@@ -184,6 +186,19 @@ export function readMetadata(boxes: Box[], fileSize: number): VideoMetadata | nu
 
   const udta = findChild(trak, "udta");
   const encoderTag = findEncoderTag(udta);
+
+  // Keyframe detection: if stss is absent, every sample is a keyframe (per ISO/IEC 14496-12).
+  // If stss is present, only the listed samples are keyframes.
+  let keyframeCount = sttsInfo.sampleCount;
+  let allKeyframes = true;
+  if (stss) {
+    keyframeCount = readU32(stss.payload, 4);
+    allKeyframes = keyframeCount >= sttsInfo.sampleCount;
+  }
+
+  // Codec detection from stsd
+  const codec = stsd ? parseStsdCodec(stsd) : "";
+  const isHevc = codec === "hvc1" || codec === "hev1" || codec === "hvc2" || codec === "hev2";
 
   // r_frame_rate = timescale / deltasGcd
   const fps = sttsInfo.deltasGcd > 0 ? timescale / sttsInfo.deltasGcd : 0;
@@ -204,6 +219,10 @@ export function readMetadata(boxes: Box[], fileSize: number): VideoMetadata | nu
     duration: durationSeconds,
     timescale,
     sampleCount: sttsInfo.sampleCount,
+    keyframeCount,
+    allKeyframes,
+    isHevc,
+    codec,
     encoderTag,
     handlerName: handlerInfo.handlerName,
     moovAtEnd,
@@ -211,6 +230,23 @@ export function readMetadata(boxes: Box[], fileSize: number): VideoMetadata | nu
     moovOffset,
     fileSize,
   };
+}
+
+/** Parse stsd (Sample Description Box) to extract the codec fourcc. */
+function parseStsdCodec(stsd: Box): string {
+  const p = stsd.payload;
+  if (p.length < 16) return "";
+  // stsd: 4 bytes version/flags, 4 bytes entry_count, then sample entries
+  // Each video sample entry: 4 bytes size, 4 bytes type (fourcc), ...
+  // The first entry starts at offset 8.
+  const entryOffset = 8;
+  if (entryOffset + 8 > p.length) return "";
+  return String.fromCharCode(
+    p[entryOffset + 4],
+    p[entryOffset + 5],
+    p[entryOffset + 6],
+    p[entryOffset + 7],
+  );
 }
 
 /** Format a file size in bytes as a human-readable string. */
